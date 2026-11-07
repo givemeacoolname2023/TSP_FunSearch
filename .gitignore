@@ -1,0 +1,17 @@
+# secrets -- only the placeholder template is tracked
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+
+
+# run artifacts
+results.csv
+*.log
+study.md
+pdf/
+docs/
+tsp_files/
+runs

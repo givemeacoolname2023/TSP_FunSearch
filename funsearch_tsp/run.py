@@ -1,0 +1,468 @@
+"""FunSearch main loop for TSP.
+
+    python -m funsearch_tsp.run --mock --n-programs 20          # offline demo
+    python -m funsearch_tsp.run --n-programs 40                 # real DeepSeek calls
+
+Each iteration samples an island, samples k programs from it, builds a
+best-shot prompt, asks the LLM for a new `priority`, validates it statically,
+executes it in a subprocess, scores it on the training instances, and stores it
+in the island it came from. The worst half of the islands is periodically
+wiped and re-seeded from the best surviving island.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+
+from . import evaluate, llm, sandbox, skeleton, tsp
+from .prompt import build_prompt, extract_priority
+from .programs_database import Program, ProgramsDatabase
+
+RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m funsearch_tsp.run",
+        description="FunSearch for TSP: evolve a greedy priority function with an LLM.",
+    )
+    parser.add_argument("--train", nargs="+", default=list(evaluate.TRAIN_DEFAULT),
+                        help="training instances (names in tsp_files/ or paths)")
+    parser.add_argument("--validation", nargs="+", default=None,
+                        help="held-out instances scored once for the best program (never used for selection)")
+    parser.add_argument("--data-dir", default=None, help="directory holding the .tsp files")
+    parser.add_argument("--islands", type=int, default=4, help="number of islands (m)")
+    parser.add_argument("--n-programs", type=int, default=40,
+                        help="number of successfully evaluated programs to collect")
+    parser.add_argument("--max-attempts", type=int, default=None,
+                        help="hard cap on LLM calls (default 3 * n-programs + 10)")
+    parser.add_argument("--k", type=int, default=2, help="programs per prompt (k in the paper)")
+    parser.add_argument("--time-budget", type=float, default=1800.0, help="wall-clock seconds")
+    parser.add_argument("--eval-timeout", type=float, default=30.0,
+                        help="per-program evaluation timeout in seconds")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed")
+    parser.add_argument("--reset-every", type=int, default=None,
+                        help="reset the worst half every N new programs (default n_programs // 3)")
+    parser.add_argument("--t-cluster", type=float, default=0.1, help="cluster temperature T0")
+    parser.add_argument("--t-program", type=float, default=0.1, help="program-length temperature")
+    parser.add_argument("--temperature", type=float, default=1.0, help="LLM sampling temperature")
+    parser.add_argument("--max-tokens", type=int, default=1600)
+    parser.add_argument("--thinking", choices=["off", "on"], default="off",
+                        help="'off' (default) sends thinking={'type': 'disabled'}; required for "
+                             "reasoning models such as deepseek-flash, which otherwise spend the "
+                             "whole output budget on reasoning and return no code")
+    parser.add_argument("--model", default=None, help="model name (default $DEEPSEEK_MODEL)")
+    parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL")
+    parser.add_argument("--mock", action="store_true", help="offline mock LLM (no API key needed)")
+    parser.add_argument("--env-file", default=".env", help="path to the .env file with the API key")
+    parser.add_argument("--run-dir", default=None, help="output directory (default runs/<timestamp>)")
+    parser.add_argument("--tag", default=None, help="short label used in the run directory name")
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args(argv)
+
+
+def make_llm(args: argparse.Namespace):
+    if args.mock:
+        return llm.MockLLM(verbose=not args.quiet)
+    llm.load_env_file(args.env_file)
+    model = args.model or os.environ.get("DEEPSEEK_MODEL") or llm.DEFAULT_MODEL
+    base_url = args.base_url or os.environ.get("DEEPSEEK_BASE_URL") or llm.DEFAULT_BASE_URL
+    extra_body = {} if args.thinking == "on" else {"thinking": {"type": "disabled"}}
+    return llm.ChatLLM(
+        model=model,
+        base_url=base_url,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        verbose=not args.quiet,
+        extra_body=extra_body,
+    )
+
+
+def prepare_run_dir(args: argparse.Namespace) -> Path:
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        tag = args.tag or ("mock" if args.mock else "llm")
+        run_dir = RUNS_DIR / ("%s_%s" % (stamp, tag))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def write_report(
+    path: Path,
+    args: argparse.Namespace,
+    run_dir: Path,
+    instances,
+    baseline: dict,
+    seed_eval,
+    best: Optional[Program],
+    attempts: List[dict],
+    db: ProgramsDatabase,
+    started: float,
+    llm_client,
+    validation_rows: Optional[List[dict]] = None,
+) -> None:
+    wall = time.time() - started
+    ok_attempts = [a for a in attempts if a["ok"] and not a.get("duplicate")]
+    duplicates = [a for a in attempts if a.get("duplicate")]
+    lines = []  # type: List[str]
+    lines.append("# FunSearch run: %s" % (run_dir.name,))
+    lines.append("")
+    lines.append("- wall time: %.1fs" % (wall,))
+    lines.append("- training instances: %s" % (", ".join("%s (n=%d)" % (i.name, i.n) for i in instances),))
+    lines.append("- islands: %d, k = %d, programs collected: %d, LLM calls: %d"
+                 % (db.num_islands, db.num_sampled, len(ok_attempts), getattr(llm_client, "total_calls", 0)))
+    if getattr(llm_client, "total_tokens", 0):
+        lines.append("- tokens used: %d" % (llm_client.total_tokens,))
+    lines.append("- baseline (nearest neighbour) tour lengths: %s"
+                 % (", ".join("%s=%d" % (k, int(v)) for k, v in baseline.items()),))
+    lines.append("")
+
+    lines.append("## Result")
+    if best is None:
+        lines.append("No valid program was found.")
+    else:
+        lines.append("")
+        lines.append("| instance | nearest neighbour | FunSearch best | improvement |")
+        lines.append("|---|---|---|---|")
+        for name, nn in baseline.items():
+            length = best.lengths.get(name)
+            rel = best.rel.get(name, 0.0)
+            lines.append("| %s | %d | %s | %+.2f%% |" % (name, int(nn), length, 100.0 * rel))
+        lines.append("")
+        lines.append("- best score (mean relative improvement): %+.6f" % (best.score,))
+        lines.append("- best program id: %d (island %d, %d chars)"
+                     % (best.program_id, best.island_id, len(best.code)))
+    lines.append("")
+
+    if best is not None and validation_rows:
+        lines.append("## Validation (held-out, not used for selection)")
+        lines.append("")
+        lines.append("| instance | n | nearest neighbour | FunSearch best | improvement |")
+        lines.append("|---|---|---|---|---|")
+        for row in validation_rows:
+            lines.append("| %s | %d | %d | %d | %+.2f%% |"
+                         % (row["instance"], row["n"], row["nn"], row["ours"], row["improvement"]))
+        lines.append("")
+        mean = sum(r["improvement"] for r in validation_rows) / len(validation_rows)
+        lines.append("- mean improvement over nearest neighbour on held-out instances: %+.2f%%"
+                     % (mean,))
+        lines.append("")
+
+    if ok_attempts:
+        lines.append("## Convergence")
+        lines.append("")
+        lines.append("| attempt | island | score | signature | chars |")
+        lines.append("|---|---|---|---|---|")
+        for a in ok_attempts:
+            lines.append("| %d | %d | %+.6f | %s | %d |"
+                         % (a["attempt"], a["island"], a["score"],
+                            tuple(a["signature"]), len(a["code"])))
+        lines.append("")
+
+    lines.append("## Islands")
+    lines.append("")
+    stats = db.stats()
+    for i, island in enumerate(db.islands):
+        lines.append("- island %d: %d programs, %d clusters, best %+.6f"
+                     % (i, island.size, len(island.clusters), island.best_score))
+    if db.events:
+        lines.append("")
+        lines.append("## Island resets")
+        lines.append("")
+        for event in db.events:
+            lines.append("- island %d re-seeded from island %d program %d (score %+.6f)"
+                         % (event["island_id"], event["donor_island"],
+                            event["donor_program"], event["score"]))
+    lines.append("")
+
+    lines.append("## Failure statistics")
+    lines.append("")
+    rejected = [a for a in attempts if not a["ok"]]
+    lines.append("- attempts: %d, new programs stored: %d, duplicates: %d, rejected/failed: %d"
+                 % (len(attempts), len(ok_attempts), len(duplicates), len(rejected)))
+    if rejected:
+        counts = {}
+        for a in rejected[:200]:
+            key = a["error"].split(":")[0][:60]
+            counts[key] = counts.get(key, 0) + 1
+        for key, value in sorted(counts.items(), key=lambda kv: -kv[1]):
+            lines.append("  - %s: %d" % (key, value))
+    lines.append("")
+
+    if best is not None:
+        lines.append("## Best program")
+        lines.append("")
+        lines.append("```python")
+        lines.append(best.code.strip())
+        lines.append("```")
+        lines.append("")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    run_dir = prepare_run_dir(args)
+    rng = np.random.default_rng(args.seed)
+
+    instances = tsp.load_instances(args.train, args.data_dir)
+    payload = evaluate.instances_payload(instances)
+    train_names = [i.name for i in instances]
+    validation_instances = (
+        tsp.load_instances(args.validation, args.data_dir) if args.validation else []
+    )
+
+    client = make_llm(args)
+    cache = sandbox.ResultCache(run_dir / "cache.json")
+
+    config = {
+        "argv": sys.argv[1:] if argv is None else list(argv),
+        "run_dir": str(run_dir),
+        "train": train_names,
+        "validation": [i.name for i in validation_instances],
+        "islands": args.islands,
+        "n_programs": args.n_programs,
+        "k": args.k,
+        "time_budget": args.time_budget,
+        "eval_timeout": args.eval_timeout,
+        "seed": args.seed,
+        "t_cluster": args.t_cluster,
+        "t_program": args.t_program,
+        "llm_temperature": args.temperature,
+        "thinking": args.thinking,
+        "model": getattr(client, "model", "mock"),
+        "base_url": getattr(client, "base_url", ""),
+        "mock": bool(args.mock),
+        "python": sys.version.split()[0],
+        "numpy": np.__version__,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_dir / "config.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    if not args.quiet:
+        print("FunSearch for TSP")
+        print("  run dir   : %s" % (run_dir,))
+        print("  llm       : %s" % (config["model"] if not args.mock else "mock (offline)",))
+        print("  train     : %s" % (", ".join("%s n=%d" % (i.name, i.n) for i in instances),))
+        print("  islands   : %d, k=%d, programs=%d, budget=%.0fs"
+              % (args.islands, args.k, args.n_programs, args.time_budget))
+
+    started = time.time()
+    baseline = evaluate.compute_baseline(payload, timeout=max(60.0, args.eval_timeout * 2))
+    seed_eval = evaluate.evaluate_program(
+        skeleton.SEED_PRIORITY, payload, baseline, timeout=args.eval_timeout
+    )
+    if not seed_eval.ok:  # pragma: no cover - the seed is our own code
+        raise RuntimeError("seed program failed: %s" % (seed_eval.error,))
+    if not args.quiet:
+        print("  baseline  : %s" % (", ".join("%s=%d" % (k, int(v)) for k, v in baseline.items()),))
+
+    seed_program = Program(
+        program_id=0,
+        code=skeleton.SEED_PRIORITY.strip(),
+        score=seed_eval.score,
+        signature=seed_eval.signature,
+        lengths=seed_eval.lengths,
+        rel=seed_eval.rel,
+        origin="seed",
+    )
+    db = ProgramsDatabase(
+        num_islands=args.islands,
+        seed_program=seed_program,
+        rng=rng,
+        t_cluster=args.t_cluster,
+        t_program=args.t_program,
+        num_sampled=args.k,
+    )
+    (run_dir / "seed_priority.py").write_text(skeleton.SEED_PRIORITY, encoding="utf-8")
+
+    max_attempts = args.max_attempts or (3 * args.n_programs + 10)
+    reset_every = args.reset_every or max(1, args.n_programs // 3)
+    programs_path = run_dir / "programs.jsonl"
+    attempts = []  # type: List[dict]
+    collected = 0
+    attempt = 0
+    consecutive_llm_errors = 0
+    consecutive_duplicates = 0
+    seen = set([sandbox.code_key(skeleton.SEED_PRIORITY)])
+    best_seen = seed_program.score
+
+    try:
+        with programs_path.open("w", encoding="utf-8") as log:
+            while collected < args.n_programs and attempt < max_attempts:
+                if time.time() - started > args.time_budget:
+                    if not args.quiet:
+                        print("  ! time budget exhausted after %d programs" % (collected,))
+                    break
+
+                attempt += 1
+                island_id, parents = db.sample()
+                prompt_text = build_prompt(parents, train_names, baseline, attempt)
+                try:
+                    reply = client.generate(prompt_text)
+                    code = extract_priority(reply)
+                except llm.LLMError as exc:
+                    consecutive_llm_errors += 1
+                    record = {
+                        "attempt": attempt, "island": island_id, "ok": False,
+                        "error": "llm: %s" % (exc,), "code": "", "score": None,
+                        "signature": [], "lengths": {}, "duplicate": False,
+                        "cached": False, "elapsed": 0.0, "parents": [p.program_id for p in parents],
+                        "time": time.time() - started,
+                    }
+                    attempts.append(record)
+                    log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    log.flush()
+                    if consecutive_llm_errors >= 5:
+                        raise
+                    continue
+                except ValueError as exc:  # unparsable reply: not the LLM's fault, retry
+                    consecutive_llm_errors = 0
+                    record = {
+                        "attempt": attempt, "island": island_id, "ok": False,
+                        "error": "parse: %s" % (exc,), "code": reply[:2000],
+                        "score": None, "signature": [], "lengths": {},
+                        "duplicate": False, "cached": False, "elapsed": 0.0,
+                        "parents": [p.program_id for p in parents],
+                        "time": time.time() - started,
+                    }
+                    attempts.append(record)
+                    log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    log.flush()
+                    continue
+                consecutive_llm_errors = 0
+
+                key = sandbox.code_key(code)
+                duplicate = key in seen
+                evaluation = evaluate.evaluate_program(
+                    code, payload, baseline, timeout=args.eval_timeout, cache=cache
+                )
+                seen.add(key)
+                consecutive_duplicates = consecutive_duplicates + 1 if duplicate else 0
+
+                if evaluation.ok and not duplicate:
+                    program = Program(
+                        program_id=-1,
+                        code=code.strip(),
+                        score=evaluation.score,
+                        signature=evaluation.signature,
+                        lengths=evaluation.lengths,
+                        rel=evaluation.rel,
+                        parents=tuple(p.program_id for p in parents),
+                    )
+                    db.add(program, island_id)
+                    collected += 1
+                    improved = evaluation.score > best_seen
+                    if improved:
+                        best_seen = evaluation.score
+                    if collected % reset_every == 0:
+                        db.reset_worst_half()
+
+                record = {
+                    "attempt": attempt,
+                    "island": island_id,
+                    "ok": bool(evaluation.ok),
+                    "error": evaluation.error,
+                    "score": evaluation.score if evaluation.ok else None,
+                    "signature": list(evaluation.signature),
+                    "lengths": evaluation.lengths,
+                    "duplicate": bool(duplicate),
+                    "cached": bool(evaluation.cached),
+                    "elapsed": round(evaluation.elapsed, 3),
+                    "parents": [p.program_id for p in parents],
+                    "time": round(time.time() - started, 2),
+                    "code": code,
+                }
+                attempts.append(record)
+                log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                log.flush()
+
+                if not args.quiet:
+                    if evaluation.ok and not duplicate:
+                        print("  [%3d/%d] island=%d score=%+.4f sig=%s %.2fs%s"
+                              % (collected, args.n_programs, island_id, evaluation.score,
+                                 tuple(evaluation.signature), evaluation.elapsed,
+                                 " *best*" if improved else ""))
+                    elif duplicate:
+                        print("  [%3d] attempt %d: duplicate program, skipped" % (collected, attempt))
+                    else:
+                        print("  [%3d] attempt %d: rejected (%s)"
+                              % (collected, attempt, evaluation.error or "invalid"))
+
+                if consecutive_duplicates >= 20:
+                    if not args.quiet:
+                        print("  ! the sampler returned 20 already-evaluated programs in a row;"
+                              " stopping early")
+                    break
+    except KeyboardInterrupt:
+        print("\n  ! interrupted by the user, saving what we have")
+    finally:
+        cache.save()
+
+    best = db.best_program()
+    if best is not None:
+        (run_dir / "best_priority.py").write_text(best.code.strip() + "\n", encoding="utf-8")
+
+    validation_rows = []  # type: List[dict]
+    if best is not None and validation_instances:
+        vpayload = evaluate.instances_payload(validation_instances)
+        vbaseline = evaluate.compute_baseline(
+            vpayload, timeout=max(60.0, args.eval_timeout * 2)
+        )
+        ok, result, _ = sandbox.run_source(
+            skeleton.build_source(best.code), vpayload, timeout=args.eval_timeout
+        )
+        if ok:
+            for inst in validation_instances:
+                nn = int(vbaseline[inst.name])
+                ours = int(result["lengths"][inst.name])
+                validation_rows.append({
+                    "instance": inst.name,
+                    "n": inst.n,
+                    "nn": nn,
+                    "ours": ours,
+                    "improvement": 100.0 * (nn - ours) / nn if nn else 0.0,
+                })
+        elif not args.quiet:
+            print("  ! validation run failed: %s" % (result,))
+
+    write_report(run_dir / "report.md", args, run_dir, instances, baseline, seed_eval, best,
+                 attempts, db, started, client, validation_rows)
+
+    if not args.quiet:
+        print("")
+        if best is None:
+            print("No valid program found.")
+        else:
+            print("Best score : %+.6f" % (best.score,))
+            for name, nn in baseline.items():
+                print("  %-8s NN=%6d  best=%6s  %+6.2f%%"
+                      % (name, int(nn), best.lengths.get(name), 100.0 * best.rel.get(name, 0.0)))
+            if validation_rows:
+                mean = sum(r["improvement"] for r in validation_rows) / len(validation_rows)
+                print("Held-out   : mean %+.2f%% vs nearest neighbour" % (mean,))
+                for row in validation_rows:
+                    print("  %-8s NN=%6d  best=%6d  %+6.2f%%"
+                          % (row["instance"], row["nn"], row["ours"], row["improvement"]))
+            print("Best code  : %s" % (run_dir / "best_priority.py",))
+        print("Report     : %s" % (run_dir / "report.md",))
+        print("Solve with : python -m funsearch_tsp.solve --program \"%s\" --instances berlin52 eil101"
+              % (run_dir / "best_priority.py",))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
