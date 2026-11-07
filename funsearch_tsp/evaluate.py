@@ -22,8 +22,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from . import sandbox, skeleton
 from .tsp import TSPInstance
 
-#: Default training set: small random instances, as in the project proposal.
-TRAIN_DEFAULT = ("rand20", "rand30", "rand50")
+#: Fallback training set, used only when ``tsp_files/data/split.json`` is absent.
+#: Five instances spanning 51-100 cities, mixing clustered (eil*/berlin*/kro*)
+#: and uniform (rd100) geometry, all ``EUC_2D`` with a published optimum.
+TRAIN_DEFAULT = ("eil51", "berlin52", "st70", "kroA100", "rd100")
 
 
 @dataclass

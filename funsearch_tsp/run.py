@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -29,16 +29,45 @@ from .programs_database import Program, ProgramsDatabase
 
 RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 
+#: The frozen split written by ``tools/build_dataset.py``. When it exists it
+#: decides which instances train and which are held out, so a run cannot
+#: accidentally overlap the two groups.
+SPLIT_JSON = Path(__file__).resolve().parent.parent / "tsp_files" / "data" / "split.json"
+
+
+def split_defaults():
+    """Return ``(train, validation)`` from the frozen split, or ``(None, None)``."""
+    if not SPLIT_JSON.exists():
+        return None, None
+    try:
+        data = json.loads(SPLIT_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    train = [n for n in data.get("search", []) if n]
+    validation = [n for n in data.get("validation", []) if n]
+    return (train or None), (validation or None)
+
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m funsearch_tsp.run",
         description="FunSearch for TSP: evolve a greedy priority function with an LLM.",
     )
-    parser.add_argument("--train", nargs="+", default=list(evaluate.TRAIN_DEFAULT),
-                        help="training instances (names in tsp_files/ or paths)")
+    parser.add_argument("--train", nargs="+", default=None,
+                        help="training instances (names in tsp_files/ or paths); "
+                             "default: the `search` group of tsp_files/data/split.json")
     parser.add_argument("--validation", nargs="+", default=None,
-                        help="held-out instances scored once for the best program (never used for selection)")
+                        help="held-out instances scored once for the best program "
+                             "(never used for selection); default: the `validation` group")
+    parser.add_argument("--validation-trace", dest="validation_trace",
+                        action="store_true", default=True,
+                        help="also score the held-out set whenever a new global best "
+                             "appears (logged only; the scores never feed back into "
+                             "sampling, resetting or stopping)")
+    parser.add_argument("--no-validation-trace", dest="validation_trace",
+                        action="store_false",
+                        help="disable the held-out trace; the final held-out table is "
+                             "still produced")
     parser.add_argument("--data-dir", default=None, help="directory holding the .tsp files")
     parser.add_argument("--islands", type=int, default=4, help="number of islands (m)")
     parser.add_argument("--n-programs", type=int, default=40,
@@ -67,7 +96,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--run-dir", default=None, help="output directory (default runs/<timestamp>)")
     parser.add_argument("--tag", default=None, help="short label used in the run directory name")
     parser.add_argument("--quiet", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.train is None or args.validation is None:
+        train_default, validation_default = split_defaults()
+        if args.train is None:
+            args.train = train_default or list(evaluate.TRAIN_DEFAULT)
+        if args.validation is None:
+            args.validation = validation_default
+    return args
 
 
 def make_llm(args: argparse.Namespace):
@@ -111,6 +148,7 @@ def write_report(
     started: float,
     llm_client,
     validation_rows: Optional[List[dict]] = None,
+    validation_trace: Optional[List[dict]] = None,
 ) -> None:
     wall = time.time() - started
     ok_attempts = [a for a in attempts if a["ok"] and not a.get("duplicate")]
@@ -158,6 +196,32 @@ def write_report(
         lines.append("- mean improvement over nearest neighbour on held-out instances: %+.2f%%"
                      % (mean,))
         lines.append("")
+
+    if validation_trace:
+        lines.append("## Validation trajectory (held-out, logged only)")
+        lines.append("")
+        lines.append("The held-out set was scored each time the *search* score reached a new "
+                     "global best. These numbers were written to this file and never fed back "
+                     "into sampling, island resets or the stopping rule.")
+        lines.append("")
+        lines.append("| programs collected | attempt | search score | held-out mean |")
+        lines.append("|---|---|---|---|")
+        for row in validation_trace:
+            lines.append("| %d | %d | %+.4f | %+.2f%% |"
+                         % (row["collected"], row["attempt"],
+                            row["search_score"], row["validation_mean"]))
+        lines.append("")
+        if len(validation_trace) >= 2:
+            first = validation_trace[0]["validation_mean"]
+            last = validation_trace[-1]["validation_mean"]
+            lines.append("- held-out mean moved from %+.2f%% to %+.2f%% across the run (%+.2f points)"
+                         % (first, last, last - first))
+            lines.append("- meanwhile the search score moved from %+.4f to %+.4f (%+.2f points)"
+                         % (validation_trace[0]["search_score"],
+                            validation_trace[-1]["search_score"],
+                            100.0 * (validation_trace[-1]["search_score"]
+                                     - validation_trace[0]["search_score"])))
+            lines.append("")
 
     if ok_attempts:
         lines.append("## Convergence")
@@ -222,6 +286,34 @@ def main(argv=None) -> int:
     validation_instances = (
         tsp.load_instances(args.validation, args.data_dir) if args.validation else []
     )
+    # Serialise the held-out set once: neither its payload nor its
+    # nearest-neighbour baseline changes during a run.
+    validation_payload = (
+        evaluate.instances_payload(validation_instances) if validation_instances else None
+    )
+    validation_baseline = {}  # type: Dict[str, int]
+    validation_trace = []  # type: List[dict]
+
+    def probe_validation(code):
+        """Score the held-out set. Logged only; never feeds back into the search."""
+        if validation_payload is None:
+            return None
+        if not validation_baseline:
+            validation_baseline.update(
+                evaluate.compute_baseline(
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2)))
+        ok, result, _ = sandbox.run_source(
+            skeleton.build_source(code), validation_payload, timeout=args.eval_timeout)
+        if not ok:
+            if not args.quiet:
+                print("  ! held-out probe failed: %s" % (result,))
+            return None
+        scores = []
+        for inst in validation_instances:
+            nn = int(validation_baseline[inst.name])
+            ours = int(result["lengths"][inst.name])
+            scores.append(100.0 * (nn - ours) / nn if nn else 0.0)
+        return sum(scores) / len(scores)
 
     client = make_llm(args)
     cache = sandbox.ResultCache(run_dir / "cache.json")
@@ -368,6 +460,18 @@ def main(argv=None) -> int:
                     improved = evaluation.score > best_seen
                     if improved:
                         best_seen = evaluation.score
+                        if args.validation_trace:
+                            heldout = probe_validation(code)
+                            if heldout is not None:
+                                validation_trace.append({
+                                    "collected": collected,
+                                    "attempt": attempt,
+                                    "search_score": evaluation.score,
+                                    "validation_mean": heldout,
+                                })
+                                if not args.quiet:
+                                    print("            ^ held-out (logged, not used): %+.2f%%"
+                                          % (heldout,))
                     if collected % reset_every == 0:
                         db.reset_worst_half()
 
@@ -417,17 +521,17 @@ def main(argv=None) -> int:
         (run_dir / "best_priority.py").write_text(best.code.strip() + "\n", encoding="utf-8")
 
     validation_rows = []  # type: List[dict]
-    if best is not None and validation_instances:
-        vpayload = evaluate.instances_payload(validation_instances)
-        vbaseline = evaluate.compute_baseline(
-            vpayload, timeout=max(60.0, args.eval_timeout * 2)
-        )
+    if best is not None and validation_payload is not None:
+        if not validation_baseline:
+            validation_baseline.update(
+                evaluate.compute_baseline(
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2)))
         ok, result, _ = sandbox.run_source(
-            skeleton.build_source(best.code), vpayload, timeout=args.eval_timeout
+            skeleton.build_source(best.code), validation_payload, timeout=args.eval_timeout
         )
         if ok:
             for inst in validation_instances:
-                nn = int(vbaseline[inst.name])
+                nn = int(validation_baseline[inst.name])
                 ours = int(result["lengths"][inst.name])
                 validation_rows.append({
                     "instance": inst.name,
@@ -440,26 +544,36 @@ def main(argv=None) -> int:
             print("  ! validation run failed: %s" % (result,))
 
     write_report(run_dir / "report.md", args, run_dir, instances, baseline, seed_eval, best,
-                 attempts, db, started, client, validation_rows)
+                 attempts, db, started, client, validation_rows, validation_trace)
 
     if not args.quiet:
         print("")
         if best is None:
             print("No valid program found.")
         else:
-            print("Best score : %+.6f" % (best.score,))
+            print("search      (train, %d instances)      : mean %+.2f%% vs nearest neighbour"
+                  % (len(instances), 100.0 * best.score))
             for name, nn in baseline.items():
                 print("  %-8s NN=%6d  best=%6s  %+6.2f%%"
                       % (name, int(nn), best.lengths.get(name), 100.0 * best.rel.get(name, 0.0)))
             if validation_rows:
                 mean = sum(r["improvement"] for r in validation_rows) / len(validation_rows)
-                print("Held-out   : mean %+.2f%% vs nearest neighbour" % (mean,))
+                print("validation  (held-out, %d instances)   : mean %+.2f%% vs nearest neighbour"
+                      % (len(validation_rows), mean))
                 for row in validation_rows:
                     print("  %-8s NN=%6d  best=%6d  %+6.2f%%"
                           % (row["instance"], row["nn"], row["ours"], row["improvement"]))
+                print("            (never used for selection; only reported)")
+            if validation_trace:
+                print("held-out trace: %d points, %+.2f%% -> %+.2f%% while search went %+.4f -> %+.4f"
+                      % (len(validation_trace),
+                         validation_trace[0]["validation_mean"],
+                         validation_trace[-1]["validation_mean"],
+                         validation_trace[0]["search_score"],
+                         validation_trace[-1]["search_score"]))
             print("Best code  : %s" % (run_dir / "best_priority.py",))
         print("Report     : %s" % (run_dir / "report.md",))
-        print("Solve with : python -m funsearch_tsp.solve --program \"%s\" --instances berlin52 eil101"
+        print('Solve with : python -m funsearch_tsp.solve --program "%s" --group search'
               % (run_dir / "best_priority.py",))
     return 0
 

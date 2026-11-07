@@ -5,6 +5,7 @@
 
 # python
 __pycache__/
+.pytest_cache/
 
 
 # run artifacts
@@ -13,5 +14,7 @@ results.csv
 study.md
 pdf/
 docs/
-tsp_files/
-runs
+all_tsp_files/
+runs/
+data/
+tools/

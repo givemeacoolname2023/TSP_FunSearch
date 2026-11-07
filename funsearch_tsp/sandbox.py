@@ -13,7 +13,9 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
-import queue as queue_module
+import pickle
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -119,9 +121,35 @@ def validate_candidate(priority_code: str) -> None:
 # --------------------------------------------------------------------------- #
 # child process
 # --------------------------------------------------------------------------- #
-def _child_entry(source, instances, out_queue, want_tours=False) -> None:
-    """Entry point of the evaluation subprocess (must stay module level)."""
+def _write_result(path: str, payload: Tuple[str, object]) -> None:
+    """Hand a result back to the parent through a file, never through a pipe."""
+    if not path:
+        return
     try:
+        with open(path, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+def _child_entry(args_path: str) -> None:
+    """Entry point of the evaluation subprocess (must stay module level).
+
+    The job is read from, and the result written to, ordinary files. A
+    ``multiprocessing.Queue`` cannot be used here: when the payload is larger
+    than the OS pipe buffer, the child's feeder thread blocks while the parent
+    sits in ``join()``, so a worker that has already finished looks like a
+    timeout. Tours are only requested by ``solve.py``, which is exactly the
+    case where that payload grows past the buffer.
+    """
+    result_path = ""
+    try:
+        with open(args_path, "rb") as handle:
+            job = pickle.load(handle)
+        source = job["source"]
+        instances = job["instances"]
+        want_tours = job["want_tours"]
+        result_path = job["result_path"]
         np.random.seed(0)  # deterministic heuristics even if they sample
         namespace = {"np": np, "__name__": "funsearch_candidate", "__builtins__": __builtins__}
         exec(compile(source, "<FunSearch candidate>", "exec"), namespace)
@@ -150,12 +178,9 @@ def _child_entry(source, instances, out_queue, want_tours=False) -> None:
             if want_tours:
                 tours[name] = [int(c) for c in tour]
 
-        out_queue.put(("ok", {"lengths": lengths, "tours": tours}))
+        _write_result(result_path, ("ok", {"lengths": lengths, "tours": tours}))
     except BaseException as exc:  # noqa: BLE001 - report everything to the parent
-        try:
-            out_queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
-        except Exception:
-            pass
+        _write_result(result_path, ("error", "%s: %s" % (type(exc).__name__, exc)))
 
 
 def run_source(
@@ -171,47 +196,45 @@ def run_source(
     empty unless ``want_tours``); otherwise ``payload`` is an error string.
     """
     ctx = mp.get_context("spawn")
-    out_queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_child_entry, args=(source, instances, out_queue, want_tours)
-    )
-    proc.daemon = True
-    started = time.time()
-    proc.start()
-    proc.join(timeout)
-    elapsed = time.time() - started
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5.0)
-        if proc.is_alive() and hasattr(proc, "kill"):
-            proc.kill()
-            proc.join(5.0)
-        try:
-            out_queue.close()
-        except Exception:
-            pass
-        return False, "Timeout after %.1fs" % (timeout,), elapsed
-
-    payload = None
+    workdir = tempfile.mkdtemp(prefix="funsearch_eval_")
+    args_path = os.path.join(workdir, "job.pkl")
+    result_path = os.path.join(workdir, "result.pkl")
     try:
-        payload = out_queue.get(timeout=10.0)
-    except queue_module.Empty:
-        payload = None
-    except Exception:
-        payload = None
-    finally:
-        try:
-            out_queue.close()
-        except Exception:
-            pass
+        with open(args_path, "wb") as handle:
+            pickle.dump({"source": source, "instances": instances,
+                         "want_tours": want_tours, "result_path": result_path},
+                        handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-    if payload is None:
-        return False, "worker died without a result (exitcode=%r)" % (proc.exitcode,), elapsed
-    kind, value = payload
-    if kind == "ok":
-        return True, value, elapsed
-    return False, str(value), elapsed
+        proc = ctx.Process(target=_child_entry, args=(args_path,))
+        proc.daemon = True
+        started = time.time()
+        proc.start()
+        proc.join(timeout)
+        elapsed = time.time() - started
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5.0)
+            if proc.is_alive() and hasattr(proc, "kill"):
+                proc.kill()
+                proc.join(5.0)
+            return False, "Timeout after %.1fs" % (timeout,), elapsed
+
+        if not os.path.exists(result_path):
+            return False, ("worker died without a result (exitcode=%r)"
+                           % (proc.exitcode,)), elapsed
+        try:
+            with open(result_path, "rb") as handle:
+                payload = pickle.load(handle)
+        except Exception as exc:
+            return False, "unreadable worker result (%s)" % (exc,), elapsed
+
+        kind, value = payload
+        if kind == "ok":
+            return True, value, elapsed
+        return False, str(value), elapsed
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
