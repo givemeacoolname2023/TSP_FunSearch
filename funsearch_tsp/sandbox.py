@@ -55,21 +55,36 @@ FORBIDDEN_CALLS = {
     "memoryview",
 }
 
-#: Functions of the skeleton a candidate must not shadow.
-RESERVED_DEFS = {"solve", "evaluate_tour"}
+#: Functions of the skeleton a candidate must not shadow.  Covers both the
+#: greedy skeleton (``solve``) and the ILS skeleton (``ils`` and its helpers).
+RESERVED_DEFS = {
+    "solve",
+    "evaluate_tour",
+    "ils",
+    "greedy_construct",
+    "local_search",
+    "two_opt",
+    "or_opt",
+    "cheapest_insertion",
+    "remove_cities",
+    "tour_length",
+    "features_of",
+}
 
 
 class ProgramRejected(ValueError):
     """The candidate failed the static checks and was never executed."""
 
 
-def validate_candidate(priority_code: str) -> None:
+def validate_candidate(priority_code: str, skel=None) -> None:
     """Raise :class:`ProgramRejected` unless the code is safe to try.
 
-    Checks, in order: it defines ``priority`` with the frozen signature, it
-    only imports allowed modules, it does not call dangerous builtins, it does
-    not touch dunder attributes, and it does not redefine the skeleton.
+    Checks, in order: it defines the evolved function with the frozen
+    signature, it only imports allowed modules, it does not call dangerous
+    builtins, it does not touch dunder attributes, and it does not redefine the
+    skeleton.  ``skel`` selects the skeleton module (default: greedy).
     """
+    skel = skel if skel is not None else skeleton
     code = (priority_code or "").strip()
     if not code:
         raise ProgramRejected("empty program")
@@ -79,7 +94,7 @@ def validate_candidate(priority_code: str) -> None:
         raise ProgramRejected("SyntaxError: %s" % (exc,))
 
     try:
-        skeleton.check_signature(code)
+        skel.check_signature(code)
     except ValueError as exc:
         raise ProgramRejected(str(exc))
 
@@ -113,7 +128,7 @@ def validate_candidate(priority_code: str) -> None:
 
     # Building the full module compiles the candidate together with the skeleton.
     try:
-        skeleton.build_source(code)
+        skel.build_source(code)
     except SyntaxError as exc:
         raise ProgramRejected("SyntaxError: %s" % (exc,))
 
@@ -154,10 +169,13 @@ def _child_entry(args_path: str) -> None:
         namespace = {"np": np, "__name__": "funsearch_candidate", "__builtins__": __builtins__}
         exec(compile(source, "<FunSearch candidate>", "exec"), namespace)
 
-        solve = namespace.get("solve")
+        # One of the two skeletons is in play: the greedy one exposes `solve`,
+        # the ILS one exposes `ils`; both expose `evaluate_tour` and exactly one
+        # evolved function.
+        solver = namespace.get("solve") or namespace.get("ils")
+        evolved = namespace.get("priority") or namespace.get("destroy_priority")
         evaluate_tour = namespace.get("evaluate_tour")
-        priority = namespace.get("priority")
-        if not (callable(solve) and callable(evaluate_tour) and callable(priority)):
+        if not (callable(solver) and callable(evaluate_tour) and callable(evolved)):
             raise RuntimeError("skeleton functions missing after exec")
 
         lengths = {}  # type: Dict[str, int]
@@ -168,7 +186,7 @@ def _child_entry(args_path: str) -> None:
                 "coords": np.asarray(blob["coords"], dtype=np.float64),
                 "n": int(blob["n"]),
             }
-            tour = np.asarray(solve(problem, priority)).ravel()
+            tour = np.asarray(solver(problem, evolved)).ravel()
             n = problem["n"]
             if tour.shape[0] != n:
                 raise ValueError("tour has %d cities, expected %d" % (tour.shape[0], n))
@@ -240,19 +258,27 @@ def run_source(
 # --------------------------------------------------------------------------- #
 # result cache (never pay for the same program twice)
 # --------------------------------------------------------------------------- #
-def code_key(priority_code: str) -> str:
-    """Stable hash of a program: insensitive to leading/trailing whitespace."""
+def code_key(priority_code: str, namespace: str = "") -> str:
+    """Stable hash of a program, scoped to a skeleton.
+
+    ``namespace`` (the skeleton name) is part of the hash on purpose: the cached
+    score of a program is only meaningful for the skeleton it was measured on,
+    so changing the skeleton must invalidate old entries instead of silently
+    returning stale numbers.
+    """
     normalized = "\n".join(
         line.rstrip() for line in (priority_code or "").strip().splitlines() if line.strip()
     )
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    payload = (namespace + "\n" + normalized) if namespace else normalized
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ResultCache(object):
     """JSON-backed ``code_hash -> evaluation record`` cache."""
 
-    def __init__(self, path) -> None:
+    def __init__(self, path, namespace: str = "") -> None:
         self.path = Path(path)
+        self.namespace = namespace or ""
         self.data = {}  # type: Dict[str, dict]
         if self.path.is_file():
             try:
@@ -261,10 +287,10 @@ class ResultCache(object):
                 self.data = {}
 
     def get(self, priority_code: str) -> Optional[dict]:
-        return self.data.get(code_key(priority_code))
+        return self.data.get(code_key(priority_code, self.namespace))
 
     def put(self, priority_code: str, record: dict) -> None:
-        self.data[code_key(priority_code)] = record
+        self.data[code_key(priority_code, self.namespace)] = record
 
     def __len__(self) -> int:
         return len(self.data)

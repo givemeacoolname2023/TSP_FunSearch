@@ -87,6 +87,12 @@ SEED_PRIORITY = '''def priority(current, candidates, visited, dist, coords, step
     return -dist[current, candidates]
 '''
 
+#: Uniform interface shared with ``skeleton_ils`` (see ``funsearch_tsp/skeletons.py``).
+NAME = "greedy"
+EVOLVED_NAME = "priority"
+SIGNATURE_ARGS = ["current", "candidates", "visited", "dist", "coords", "step", "n"]
+SEED = SEED_PRIORITY
+
 #: Prompt-friendly view of the skeleton: skeleton + the empty function to evolve.
 SKELETON_WITH_STUB = (
     SKELETON_SOURCE.rstrip()

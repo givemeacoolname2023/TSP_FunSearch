@@ -93,10 +93,17 @@ def score_from_lengths(
 
 
 def compute_baseline(
-    payload: Dict[str, dict], timeout: float = 60.0
+    payload: Dict[str, dict], timeout: float = 60.0, skel=None
 ) -> Dict[str, float]:
-    """Tour lengths of the seed (nearest-neighbour) program, one per instance."""
-    source = skeleton.build_source(skeleton.SEED_PRIORITY)
+    """Tour lengths of the skeleton's seed program, one per instance.
+
+    For the greedy skeleton that is nearest neighbour; for the ILS skeleton it
+    is the ILS driven by the trivial *random-destruction* seed, so score 0 means
+    "no better than random destruction" — the baseline the evolved operator has
+    to beat.
+    """
+    skel = skel if skel is not None else skeleton
+    source = skel.build_source(skel.SEED)
     ok, result, _ = sandbox.run_source(source, payload, timeout=timeout)
     if not ok:
         raise RuntimeError("the seed program failed to run: %s" % (result,))
@@ -110,20 +117,22 @@ def evaluate_program(
     timeout: float = 30.0,
     cache: Optional[sandbox.ResultCache] = None,
     use_cache: bool = True,
+    skel=None,
 ) -> Evaluation:
-    """Static-check, execute and score one candidate ``priority`` program."""
+    """Static-check, execute and score one candidate program."""
+    skel = skel if skel is not None else skeleton
     if cache is not None and use_cache:
         hit = cache.get(priority_code)
         if hit is not None:
             return Evaluation.from_dict(hit)
 
     try:
-        sandbox.validate_candidate(priority_code)
+        sandbox.validate_candidate(priority_code, skel=skel)
     except sandbox.ProgramRejected as exc:
         return Evaluation(ok=False, error="rejected: %s" % (exc,))
 
     try:
-        source = skeleton.build_source(priority_code)
+        source = skel.build_source(priority_code)
     except SyntaxError as exc:  # pragma: no cover - validate_candidate catches it
         return Evaluation(ok=False, error="SyntaxError: %s" % (exc,))
 

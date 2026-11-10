@@ -195,6 +195,43 @@ _FARTHEST_TEMPLATE = '''def priority_v2(current, candidates, visited, dist, coor
 '''
 
 
+_DESTROY_RANDOM = '''def destroy_priority(features):
+    """Random destruction (the trivial seed)."""
+    return features["noise"]
+'''
+
+_DESTROY_WORST = '''def destroy_priority_v2(features):
+    """Worst removal: rip out the cities whose removal saves the most length."""
+    return features["saving"]
+'''
+
+_DESTROY_RELATED = '''def destroy_priority_v2(features):
+    """Related removal: rip out a spatial cluster around a random seed city."""
+    return -features["related"]
+'''
+
+_DESTROY_MIX = '''def destroy_priority_v2(features):
+    """Mix of related and worst removal, with a little noise."""
+    related = -features["related"]
+    related = (related - related.min()) / (np.ptp(related) + 1e-9)
+    saving = features["saving"]
+    saving = (saving - saving.min()) / (np.ptp(saving) + 1e-9)
+    return %s * related + %s * saving + 0.1 * features["noise"]
+'''
+
+_DESTROY_ANGLE = '''def destroy_priority_v2(features):
+    """Prefer sharp turns and expensive cities."""
+    return features["saving"] * (1.0 + %s * features["angle"])
+'''
+
+_DESTROY_DENSE = '''def destroy_priority_v2(features):
+    """Prefer cities in dense regions, spread the removals along the tour."""
+    dense = features["density"]
+    dense = (dense - dense.mean()) / (dense.std() + 1e-9)
+    return features["saving"] / (1.0 + %s * np.abs(features["pos"])) + 0.2 * dense
+'''
+
+
 class MockLLM(object):
     """Deterministic stand-in for the real LLM (no network, no cost).
 
@@ -202,8 +239,9 @@ class MockLLM(object):
     return *different* programs and the islands/clusters actually fill up.
     """
 
-    def __init__(self, verbose: bool = True) -> None:
+    def __init__(self, verbose: bool = True, skeleton: str = "greedy") -> None:
         self.verbose = verbose
+        self.skeleton = skeleton
         self.calls = 0
         self.total_calls = 0
         self.total_tokens = 0
@@ -212,9 +250,20 @@ class MockLLM(object):
     def _next_code(self) -> str:
         step = self.calls
         self.calls += 1
-        family = step % 5
-        # 45 distinct weights per family, so a mock run stays unique for a while
         weight = "%.2f" % (0.05 + 0.02 * ((step // 5) % 45),)
+        if self.skeleton == "ils":
+            # 5 destroy operators x 45 weights, so a mock run stays unique a while
+            family = step % 5
+            if family == 0:
+                return _DESTROY_WORST
+            if family == 1:
+                return _DESTROY_RELATED
+            if family == 2:
+                return _DESTROY_MIX % (weight, "%.2f" % (1.0 - float(weight),))
+            if family == 3:
+                return _DESTROY_ANGLE % (weight,)
+            return _DESTROY_DENSE % (weight,)
+        family = step % 5
         if family == 0:
             return _LOOKAHEAD_TEMPLATE % (weight,)
         if family == 1:

@@ -1,12 +1,13 @@
-"""Apply a FunSearch-generated `priority` function to TSP instances.
+"""Apply a FunSearch-generated program to TSP instances.
 
-    python -m funsearch_tsp.solve --program runs/<ts>/best_priority.py \
-           --instances berlin52 eil51 eil101 ch130 tsp225
+    python -m funsearch_tsp.solve --program runs/<ts>/best_destroy.py --group search
+    python -m funsearch_tsp.solve --program runs/<ts>/best_priority.py --group search
 
-The generated program is a *policy*, not a tour: it is spliced into the frozen
-greedy skeleton, which then builds one tour per instance. Both the program and
-the nearest-neighbour baseline run in an isolated subprocess, so a bad program
-can only cost you a timeout.
+The generated program is a *policy*, not a tour. Which frozen skeleton it plugs
+into is detected from the file itself (``destroy_priority`` -> the ILS
+skeleton, ``priority`` -> the greedy construction skeleton), and both the
+program and the baseline run in an isolated subprocess, so a bad program can
+only cost you a timeout.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import evaluate, sandbox, skeleton, tsp
+from . import evaluate, sandbox, skeleton, skeletons, tsp
 from .prompt import extract_priority
 
 #: Published TSPLIB optima (used only to report the gap; never used for search).
@@ -91,6 +92,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "genuinely slow instances are lost)")
     parser.add_argument("--csv", default="results.csv", help="where to write the results table")
     parser.add_argument("--show-tour", action="store_true", help="print the full visiting order")
+    parser.add_argument("--skeleton", choices=["auto"] + skeletons.names(), default="auto",
+                        help="which frozen skeleton to plug the program into; 'auto' (default) "
+                             "reads it off the file: destroy_priority -> ils, priority -> greedy")
     args = parser.parse_args(argv)
 
     if args.group is not None and args.instances is not None:
@@ -128,12 +132,12 @@ def instances_for_group(group, path=None) -> List[str]:
     return names
 
 
-def load_priority_code(path) -> str:
+def load_priority_code(path, skel=None) -> str:
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     try:
-        return extract_priority(text)
+        return extract_priority(text, skel=skel)
     except ValueError as exc:
-        raise SystemExit("cannot find a `priority` function in %s: %s" % (path, exc))
+        raise SystemExit("cannot find the evolved function in %s: %s" % (path, exc))
 
 
 def _chunks(items, size):
@@ -175,9 +179,17 @@ def discover_instances(data_dir=None) -> List[str]:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    code = load_priority_code(args.program)
+    raw = Path(args.program).read_text(encoding="utf-8", errors="replace")
+    if args.skeleton == "auto":
+        skel = skeletons.detect(raw)
+        if skel is None:
+            raise SystemExit("cannot tell which skeleton %s belongs to; pass --skeleton "
+                             "greedy|ils" % (args.program,))
+    else:
+        skel = skeletons.get(args.skeleton)
+    code = load_priority_code(args.program, skel=skel)
     try:
-        sandbox.validate_candidate(code)
+        sandbox.validate_candidate(code, skel=skel)
     except sandbox.ProgramRejected as exc:
         raise SystemExit("the program in %s failed the static checks: %s" % (args.program, exc))
 
@@ -187,9 +199,13 @@ def main(argv=None) -> int:
         names = args.instances or discover_instances(args.data_dir)
     instances = tsp.load_instances(names, args.data_dir)
     payload = evaluate.instances_payload(instances)
-    source = skeleton.build_source(code)
+    source = skel.build_source(code)
 
-    baseline = evaluate.compute_baseline(payload, timeout=max(60.0, args.timeout))
+    baseline = evaluate.compute_baseline(
+        payload, timeout=max(60.0, args.timeout), skel=skel)
+    base_label = "random-destruction ILS" if getattr(skel, "NAME", "") == "ils" else "NN"
+    print("skeleton: %s (evolves %s); baseline: %s"
+          % (skel.NAME, skel.EVOLVED_NAME, base_label))
 
     # Evaluate in one batch first (fast path). A generated priority function can
     # be super-quadratic in n, so a single 1800-city instance may need more wall
@@ -214,7 +230,7 @@ def main(argv=None) -> int:
     rows = []  # type: List[dict]
     known_optima = load_known_optima()
     print("%-10s %5s %9s %9s %10s %9s %9s" %
-          ("instance", "n", "NN", "FunSearch", "improve", "optimum", "gap"))
+          ("instance", "n", base_label, "FunSearch", "improve", "optimum", "gap"))
     print("-" * 68)
     gaps = []  # type: List[float]
     for inst in instances:

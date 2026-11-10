@@ -1,10 +1,13 @@
 """Prompt construction (best-shot prompting) and code extraction.
 
 The prompt mirrors the structure of the program skeleton, as in Fig. 2a of the
-FunSearch paper: the frozen skeleton, the interface of ``priority``, then
-``k = 2`` previously sampled programs renamed ``priority_v0`` and
-``priority_v1`` in increasing order of score, and finally a request for
-``priority_v2``.
+FunSearch paper: the frozen skeleton, the interface of the evolved function,
+then ``k = 2`` previously sampled programs renamed ``<name>_v0`` and
+``<name>_v1`` in increasing order of score, and finally a request for
+``<name>_v2``.
+
+Two skeletons are supported (see ``funsearch_tsp/skeletons.py``): the frozen
+greedy construction (``priority``) and the frozen ILS (``destroy_priority``).
 """
 from __future__ import annotations
 
@@ -16,9 +19,11 @@ from . import skeleton
 from .programs_database import Program
 
 _FENCE_RE = re.compile(r"```(?:python|py)?\s*\n?(.*?)(?:```|$)", re.DOTALL)
-_DEF_RE = re.compile(r"^[ \t]*def[ \t]+priority(?:_v\d+)?[ \t]*\(", re.MULTILINE)
-_ANY_DEF_RE = re.compile(r"def[ \t]+priority(?:_v\d+)?[ \t]*\(")
-_DEF_NAME_RE = re.compile(r"def[ \t]+priority(?:_v\d+)?[ \t]*\(")
+_DEF_RE = re.compile(
+    r"^[ \t]*def[ \t]+(?:destroy_)?priority(?:_v\d+)?[ \t]*\(", re.MULTILINE
+)
+_ANY_DEF_RE = re.compile(r"def[ \t]+(?:destroy_)?priority(?:_v\d+)?[ \t]*\(")
+_DEF_NAME_RE = re.compile(r"def[ \t]+(?:destroy_)?priority(?:_v\d+)?[ \t]*\(")
 
 
 def _rename_function(code: str, new_name: str = "priority") -> str:
@@ -52,13 +57,15 @@ def _trim_to_compilable(code: str) -> str:
     return ""
 
 
-def extract_priority(response: str) -> str:
-    """Pull the ``priority`` function out of an LLM reply.
+def extract_priority(response: str, skel=None) -> str:
+    """Pull the evolved function out of an LLM reply.
 
     Prefers a fenced code block, falls back to the raw reply, renames
-    ``priority_v<k>`` to ``priority`` and trims trailing prose. Raises
+    ``<name>_v<k>`` to the frozen name and trims trailing prose. Raises
     ``ValueError`` when no compilable function is found.
     """
+    skel = skel if skel is not None else skeleton
+    wanted = skel.EVOLVED_NAME
     if not response or not response.strip():
         raise ValueError("empty LLM response")
 
@@ -68,16 +75,16 @@ def extract_priority(response: str) -> str:
         code = _slice_from_def(text)
         if not code:
             continue
-        code = _rename_function(code)
+        code = _rename_function(code, wanted)
         code = _trim_to_compilable(code)
         if not code:
             continue
         try:
-            skeleton.check_signature(code)
+            skel.check_signature(code)
         except ValueError:
             continue
         return code
-    raise ValueError("no compilable `priority` function found in the LLM response")
+    raise ValueError("no compilable `%s` function found in the LLM response" % (wanted,))
 
 
 def _strip_docstring(code: str) -> str:
@@ -99,18 +106,14 @@ def _strip_docstring(code: str) -> str:
     return code.strip()
 
 
-def build_prompt(
-    programs: Sequence[Program],
-    train_names: Sequence[str],
-    baseline: dict,
-    round_index: int = 0,
-) -> str:
-    """Best-shot prompt from ``programs`` (sorted internally by ascending score)."""
-    ordered = sorted(programs, key=lambda p: p.score)
-    header = [
-        "You are an expert in combinatorial optimization and Python programming.",
-        "We are using FunSearch to discover a heuristic for the Traveling Salesman Problem (TSP).",
-        "",
+_IMPORT_RULES = [
+    "- Only `numpy` (as np), `math`, `random`, `itertools`, `collections`, `functools`,",
+    "  `operator` and `statistics` may be imported. No file, network or system access.",
+]
+
+
+def _greedy_prompt(programs: Sequence[Program], train_names: Sequence[str], skel) -> List[str]:
+    return [
         "## Task",
         "The skeleton below builds a tour greedily: starting at city 0, it repeatedly appends",
         "the unvisited city with the highest score returned by `priority`. Your job is to write",
@@ -119,7 +122,7 @@ def build_prompt(
         "",
         "## Frozen skeleton",
         "```python",
-        skeleton.SKELETON_WITH_STUB.rstrip(),
+        skel.SKELETON_WITH_STUB.rstrip(),
         "```",
         "",
         "## How programs are scored",
@@ -134,10 +137,75 @@ def build_prompt(
         "",
         "## Previously sampled implementations (best-shot)",
         "Below are %d implementations sampled from this island, ordered from the lowest to the"
-        % (len(ordered),),
+        % (len(programs),),
         "highest score. Use them as inspiration: keep what works and fix what does not.",
         "",
     ]
+
+
+def _ils_prompt(programs: Sequence[Program], train_names: Sequence[str], skel) -> List[str]:
+    return [
+        "## Task",
+        "The skeleton below solves a TSP instance with an iterated local search (ILS):",
+        "a nearest-neighbour tour is improved with 2-opt and Or-opt, then the following",
+        "steps are repeated for a fixed number of rounds:",
+        "  (a) destroy - remove a set of cities from the tour,",
+        "  (b) repair  - reinsert each removed city at its cheapest position,",
+        "  (c) improve - run 2-opt and Or-opt again,",
+        "  (d) accept  - keep the new tour if it is not longer.",
+        "",
+        "Your job is to write the body of `destroy_priority`, which decides WHICH cities are",
+        "removed in step (a). The number of removed cities and every other operator are fixed",
+        "by the skeleton. Removing a well-chosen set of cities lets the repair rebuild a whole",
+        "region of the tour; removing a poor set wastes the round.",
+        "The skeleton is FIXED - it must not be modified, copied or redefined.",
+        "",
+        "## Frozen skeleton",
+        "```python",
+        skel.SKELETON_WITH_STUB.rstrip(),
+        "```",
+        "",
+        "## How programs are scored",
+        "Each program runs the skeleton on these training instances: %s."
+        % (", ".join(train_names),),
+        "For instance i, with L_i the tour length the program reaches and L_seed_i the length",
+        "reached by the seed program (the same ILS driven by *random* destruction), the",
+        "per-instance score is s_i = (L_seed_i - L_i) / L_seed_i. The program's score is the",
+        "mean of the s_i: higher is better, 0.0 means 'exactly as good as random destruction',",
+        "and a perfect tour would give 1.0. Tour lengths use TSPLIB EUC_2D distances (rounded",
+        "to integers) and the tour is closed.",
+        "",
+        "## Previously sampled implementations (best-shot)",
+        "Below are %d implementations sampled from this island, ordered from the lowest to the"
+        % (len(programs),),
+        "highest score. Use them as inspiration: keep what works and fix what does not.",
+        "",
+    ]
+
+
+def build_prompt(
+    programs: Sequence[Program],
+    train_names: Sequence[str],
+    baseline: dict,
+    round_index: int = 0,
+    skel=None,
+) -> str:
+    """Best-shot prompt from ``programs`` (sorted internally by ascending score)."""
+    skel = skel if skel is not None else skeleton
+    wanted = skel.EVOLVED_NAME
+    ordered = sorted(programs, key=lambda p: p.score)
+    is_ils = getattr(skel, "NAME", "greedy") == "ils"
+
+    header = [
+        "You are an expert in combinatorial optimization and Python programming.",
+        "We are using FunSearch to discover a heuristic for the Traveling Salesman Problem (TSP).",
+        "",
+    ]
+    task = (
+        _ils_prompt(ordered, train_names, skel)
+        if is_ils
+        else _greedy_prompt(ordered, train_names, skel)
+    )
 
     body = []  # type: List[str]
     for version, program in enumerate(ordered):
@@ -146,38 +214,65 @@ def build_prompt(
         )
         body.extend(
             [
-                "### priority_v%d" % (version,),
-                "# score = %.6f   (mean relative improvement over nearest neighbour)" % (program.score,),
+                "### %s_v%d" % (wanted, version),
+                "# score = %.6f" % (program.score,),
                 "# tour lengths: %s" % (lengths,),
                 "```python",
-                _rename_function(_strip_docstring(program.code), "priority_v%d" % (version,)),
+                _rename_function(_strip_docstring(program.code), "%s_v%d" % (wanted, version)),
                 "```",
                 "",
             ]
         )
 
-    footer = [
-        "## Your task",
-        "Write a NEW implementation called `priority_v%d` (a strictly better heuristic)."
-        % (len(ordered),),
-        "Requirements:",
-        "- Exactly the same signature: priority_v%d(current, candidates, visited, dist, coords, step, n)"
-        % (len(ordered),),
-        "- Return a numpy array with exactly one finite score per entry of `candidates`,",
-        "  in the same order (use `np.asarray(..., dtype=float)` results or plain numpy ops).",
-        "- Only `numpy` (as np), `math`, `random`, `itertools`, `collections`, `functools`,",
-        "  `operator` and `statistics` may be imported. No file, network or system access.",
-        "- Any finite score scale is fine; only the relative order of the scores matters.",
-        "- Prefer short, readable, deterministic code: shorter programs are sampled more often.",
-        "",
-        "Ideas that have helped on greedy TSP constructions include: breaking distance ties",
-        "with a secondary criterion, look-ahead (cost of the next hop after choosing a city),",
-        "penalising cities that would become isolated, using the angle or direction of travel,",
-        "and scaling the distance term by the fraction of the tour already built (step / n).",
-        "",
-        "Answer with ONE Python code block containing only the function definition of",
-        "`priority_v%d`. No explanations, no tests, no example usage, no I/O."
-        % (len(ordered),),
-    ]
+    if is_ils:
+        footer = [
+            "## Your task",
+            "Write a NEW implementation called `%s_v%d` (a strictly better destroy operator)."
+            % (wanted, len(ordered)),
+            "Requirements:",
+            "- Exactly the same signature: %s_v%d(features)" % (wanted, len(ordered)),
+            "- `features` is a dict of seven arrays of shape (n,), all indexed by CITY ID:",
+            "  `gap`, `saving`, `related`, `density`, `angle`, `pos`, `noise`.",
+            "  All distances are already divided by the current average edge length, so every",
+            "  feature is scale-free; a program tuned on 50-city instances must behave the same",
+            "  way on 200-city instances. The raw distance matrix is NOT available.",
+            "- Return a numpy array of exactly n finite scores; the k highest are removed.",
+            "- Only the relative order of the scores matters.",
+        ] + _IMPORT_RULES + [
+            "- Prefer short, readable, deterministic code: shorter programs are sampled more often.",
+            "",
+            "Ideas that help in large-neighbourhood search: removing a spatially related cluster",
+            "(related removal), removing the cities whose removal saves the most length (worst",
+            "removal), combining both, penalising cities in dense regions, breaking ties with",
+            "`noise`, and using `pos` to spread the removals along the tour instead of clustering",
+            "them all in one place.",
+            "",
+            "Answer with ONE Python code block containing only the function definition of",
+            "`%s_v%d`. No explanations, no tests, no example usage, no I/O."
+            % (wanted, len(ordered)),
+        ]
+    else:
+        footer = [
+            "## Your task",
+            "Write a NEW implementation called `priority_v%d` (a strictly better heuristic)."
+            % (len(ordered),),
+            "Requirements:",
+            "- Exactly the same signature: priority_v%d(current, candidates, visited, dist, coords, step, n)"
+            % (len(ordered),),
+            "- Return a numpy array with exactly one finite score per entry of `candidates`,",
+            "  in the same order (use `np.asarray(..., dtype=float)` results or plain numpy ops).",
+        ] + _IMPORT_RULES + [
+            "- Any finite score scale is fine; only the relative order of the scores matters.",
+            "- Prefer short, readable, deterministic code: shorter programs are sampled more often.",
+            "",
+            "Ideas that have helped on greedy TSP constructions include: breaking distance ties",
+            "with a secondary criterion, look-ahead (cost of the next hop after choosing a city),",
+            "penalising cities that would become isolated, using the angle or direction of travel,",
+            "and scaling the distance term by the fraction of the tour already built (step / n).",
+            "",
+            "Answer with ONE Python code block containing only the function definition of",
+            "`priority_v%d`. No explanations, no tests, no example usage, no I/O."
+            % (len(ordered),),
+        ]
 
-    return "\n".join(header + body + footer)
+    return "\n".join(header + task + body + footer)

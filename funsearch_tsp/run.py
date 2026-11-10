@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from . import evaluate, llm, sandbox, skeleton, tsp
+from . import evaluate, llm, sandbox, skeleton, skeleton_ils, skeletons, tsp
 from .prompt import build_prompt, extract_priority
 from .programs_database import Program, ProgramsDatabase
 
@@ -53,6 +53,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="python -m funsearch_tsp.run",
         description="FunSearch for TSP: evolve a greedy priority function with an LLM.",
     )
+    parser.add_argument("--skeleton", choices=skeletons.names(), default=skeletons.DEFAULT,
+                        help="which frozen skeleton to search on: 'ils' (default, the main "
+                             "experiment: evolve destroy_priority inside iterated local search) "
+                             "or 'greedy' (the preliminary construction baseline: evolve priority)")
     parser.add_argument("--train", nargs="+", default=None,
                         help="training instances (names in tsp_files/ or paths); "
                              "default: the `search` group of tsp_files/data/split.json")
@@ -109,7 +113,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def make_llm(args: argparse.Namespace):
     if args.mock:
-        return llm.MockLLM(verbose=not args.quiet)
+        return llm.MockLLM(verbose=not args.quiet, skeleton=args.skeleton)
     llm.load_env_file(args.env_file)
     model = args.model or os.environ.get("DEEPSEEK_MODEL") or llm.DEFAULT_MODEL
     base_url = args.base_url or os.environ.get("DEEPSEEK_BASE_URL") or llm.DEFAULT_BASE_URL
@@ -149,21 +153,31 @@ def write_report(
     llm_client,
     validation_rows: Optional[List[dict]] = None,
     validation_trace: Optional[List[dict]] = None,
+    skel=None,
 ) -> None:
+    """Render ``report.md``. ``skel`` decides how the baseline is labelled."""
+    skel = skel if skel is not None else skeleton
+    is_ils = getattr(skel, "NAME", "greedy") == "ils"
+    base_label = "random-destruction ILS" if is_ils else "nearest neighbour"
     wall = time.time() - started
     ok_attempts = [a for a in attempts if a["ok"] and not a.get("duplicate")]
     duplicates = [a for a in attempts if a.get("duplicate")]
     lines = []  # type: List[str]
     lines.append("# FunSearch run: %s" % (run_dir.name,))
     lines.append("")
+    lines.append("- skeleton: `%s` (evolves `%s`)" % (skel.NAME, skel.EVOLVED_NAME))
+    if is_ils:
+        lines.append("- ILS constants: %d rounds, %d cities removed per round, "
+                     "2-opt + Or-opt local search, cheapest-insertion repair"
+                     % (skeleton_ils.DEFAULT_ITERATIONS, skeleton_ils.DEFAULT_K))
     lines.append("- wall time: %.1fs" % (wall,))
     lines.append("- training instances: %s" % (", ".join("%s (n=%d)" % (i.name, i.n) for i in instances),))
     lines.append("- islands: %d, k = %d, programs collected: %d, LLM calls: %d"
                  % (db.num_islands, db.num_sampled, len(ok_attempts), getattr(llm_client, "total_calls", 0)))
     if getattr(llm_client, "total_tokens", 0):
         lines.append("- tokens used: %d" % (llm_client.total_tokens,))
-    lines.append("- baseline (nearest neighbour) tour lengths: %s"
-                 % (", ".join("%s=%d" % (k, int(v)) for k, v in baseline.items()),))
+    lines.append("- baseline (%s) tour lengths: %s"
+                 % (base_label, ", ".join("%s=%d" % (k, int(v)) for k, v in baseline.items()),))
     lines.append("")
 
     lines.append("## Result")
@@ -171,7 +185,7 @@ def write_report(
         lines.append("No valid program was found.")
     else:
         lines.append("")
-        lines.append("| instance | nearest neighbour | FunSearch best | improvement |")
+        lines.append("| instance | %s | FunSearch best | improvement |" % (base_label,))
         lines.append("|---|---|---|---|")
         for name, nn in baseline.items():
             length = best.lengths.get(name)
@@ -186,15 +200,15 @@ def write_report(
     if best is not None and validation_rows:
         lines.append("## Validation (held-out, not used for selection)")
         lines.append("")
-        lines.append("| instance | n | nearest neighbour | FunSearch best | improvement |")
+        lines.append("| instance | n | %s | FunSearch best | improvement |" % (base_label,))
         lines.append("|---|---|---|---|---|")
         for row in validation_rows:
             lines.append("| %s | %d | %d | %d | %+.2f%% |"
                          % (row["instance"], row["n"], row["nn"], row["ours"], row["improvement"]))
         lines.append("")
         mean = sum(r["improvement"] for r in validation_rows) / len(validation_rows)
-        lines.append("- mean improvement over nearest neighbour on held-out instances: %+.2f%%"
-                     % (mean,))
+        lines.append("- mean improvement over the %s on held-out instances: %+.2f%%"
+                     % (base_label, mean))
         lines.append("")
 
     if validation_trace:
@@ -279,6 +293,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     run_dir = prepare_run_dir(args)
     rng = np.random.default_rng(args.seed)
+    skel = skeletons.get(args.skeleton)
 
     instances = tsp.load_instances(args.train, args.data_dir)
     payload = evaluate.instances_payload(instances)
@@ -301,9 +316,9 @@ def main(argv=None) -> int:
         if not validation_baseline:
             validation_baseline.update(
                 evaluate.compute_baseline(
-                    validation_payload, timeout=max(60.0, args.eval_timeout * 2)))
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel))
         ok, result, _ = sandbox.run_source(
-            skeleton.build_source(code), validation_payload, timeout=args.eval_timeout)
+            skel.build_source(code), validation_payload, timeout=args.eval_timeout)
         if not ok:
             if not args.quiet:
                 print("  ! held-out probe failed: %s" % (result,))
@@ -316,11 +331,13 @@ def main(argv=None) -> int:
         return sum(scores) / len(scores)
 
     client = make_llm(args)
-    cache = sandbox.ResultCache(run_dir / "cache.json")
+    cache = sandbox.ResultCache(run_dir / "cache.json", namespace=skel.NAME)
 
     config = {
         "argv": sys.argv[1:] if argv is None else list(argv),
         "run_dir": str(run_dir),
+        "skeleton": skel.NAME,
+        "evolved_function": skel.EVOLVED_NAME,
         "train": train_names,
         "validation": [i.name for i in validation_instances],
         "islands": args.islands,
@@ -340,6 +357,9 @@ def main(argv=None) -> int:
         "numpy": np.__version__,
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if skel.NAME == "ils":
+        config["ils_iterations"] = skeleton_ils.DEFAULT_ITERATIONS
+        config["ils_k"] = skeleton_ils.DEFAULT_K
     (run_dir / "config.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -347,15 +367,20 @@ def main(argv=None) -> int:
     if not args.quiet:
         print("FunSearch for TSP")
         print("  run dir   : %s" % (run_dir,))
+        print("  skeleton  : %s (evolves %s)" % (skel.NAME, skel.EVOLVED_NAME))
+        if skel.NAME == "ils":
+            print("  ils       : T=%d rounds, k=%d cities removed per round"
+                  % (skeleton_ils.DEFAULT_ITERATIONS, skeleton_ils.DEFAULT_K))
         print("  llm       : %s" % (config["model"] if not args.mock else "mock (offline)",))
         print("  train     : %s" % (", ".join("%s n=%d" % (i.name, i.n) for i in instances),))
         print("  islands   : %d, k=%d, programs=%d, budget=%.0fs"
               % (args.islands, args.k, args.n_programs, args.time_budget))
 
     started = time.time()
-    baseline = evaluate.compute_baseline(payload, timeout=max(60.0, args.eval_timeout * 2))
+    baseline = evaluate.compute_baseline(
+        payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel)
     seed_eval = evaluate.evaluate_program(
-        skeleton.SEED_PRIORITY, payload, baseline, timeout=args.eval_timeout
+        skel.SEED, payload, baseline, timeout=args.eval_timeout, skel=skel
     )
     if not seed_eval.ok:  # pragma: no cover - the seed is our own code
         raise RuntimeError("seed program failed: %s" % (seed_eval.error,))
@@ -364,7 +389,7 @@ def main(argv=None) -> int:
 
     seed_program = Program(
         program_id=0,
-        code=skeleton.SEED_PRIORITY.strip(),
+        code=skel.SEED.strip(),
         score=seed_eval.score,
         signature=seed_eval.signature,
         lengths=seed_eval.lengths,
@@ -379,7 +404,8 @@ def main(argv=None) -> int:
         t_program=args.t_program,
         num_sampled=args.k,
     )
-    (run_dir / "seed_priority.py").write_text(skeleton.SEED_PRIORITY, encoding="utf-8")
+    seed_name = "seed_priority.py" if skel.NAME == "greedy" else "seed_destroy.py"
+    (run_dir / seed_name).write_text(skel.SEED, encoding="utf-8")
 
     max_attempts = args.max_attempts or (3 * args.n_programs + 10)
     reset_every = args.reset_every or max(1, args.n_programs // 3)
@@ -389,7 +415,7 @@ def main(argv=None) -> int:
     attempt = 0
     consecutive_llm_errors = 0
     consecutive_duplicates = 0
-    seen = set([sandbox.code_key(skeleton.SEED_PRIORITY)])
+    seen = set([sandbox.code_key(skel.SEED, skel.NAME)])
     best_seen = seed_program.score
 
     try:
@@ -402,10 +428,10 @@ def main(argv=None) -> int:
 
                 attempt += 1
                 island_id, parents = db.sample()
-                prompt_text = build_prompt(parents, train_names, baseline, attempt)
+                prompt_text = build_prompt(parents, train_names, baseline, attempt, skel=skel)
                 try:
                     reply = client.generate(prompt_text)
-                    code = extract_priority(reply)
+                    code = extract_priority(reply, skel=skel)
                 except llm.LLMError as exc:
                     consecutive_llm_errors += 1
                     record = {
@@ -437,10 +463,10 @@ def main(argv=None) -> int:
                     continue
                 consecutive_llm_errors = 0
 
-                key = sandbox.code_key(code)
+                key = sandbox.code_key(code, skel.NAME)
                 duplicate = key in seen
                 evaluation = evaluate.evaluate_program(
-                    code, payload, baseline, timeout=args.eval_timeout, cache=cache
+                    code, payload, baseline, timeout=args.eval_timeout, cache=cache, skel=skel
                 )
                 seen.add(key)
                 consecutive_duplicates = consecutive_duplicates + 1 if duplicate else 0
@@ -517,17 +543,18 @@ def main(argv=None) -> int:
         cache.save()
 
     best = db.best_program()
+    best_name = "best_priority.py" if skel.NAME == "greedy" else "best_destroy.py"
     if best is not None:
-        (run_dir / "best_priority.py").write_text(best.code.strip() + "\n", encoding="utf-8")
+        (run_dir / best_name).write_text(best.code.strip() + "\n", encoding="utf-8")
 
     validation_rows = []  # type: List[dict]
     if best is not None and validation_payload is not None:
         if not validation_baseline:
             validation_baseline.update(
                 evaluate.compute_baseline(
-                    validation_payload, timeout=max(60.0, args.eval_timeout * 2)))
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel))
         ok, result, _ = sandbox.run_source(
-            skeleton.build_source(best.code), validation_payload, timeout=args.eval_timeout
+            skel.build_source(best.code), validation_payload, timeout=args.eval_timeout
         )
         if ok:
             for inst in validation_instances:
@@ -544,24 +571,25 @@ def main(argv=None) -> int:
             print("  ! validation run failed: %s" % (result,))
 
     write_report(run_dir / "report.md", args, run_dir, instances, baseline, seed_eval, best,
-                 attempts, db, started, client, validation_rows, validation_trace)
+                 attempts, db, started, client, validation_rows, validation_trace, skel=skel)
 
     if not args.quiet:
+        base_label = "random-destruction ILS" if skel.NAME == "ils" else "nearest neighbour"
         print("")
         if best is None:
             print("No valid program found.")
         else:
-            print("search      (train, %d instances)      : mean %+.2f%% vs nearest neighbour"
-                  % (len(instances), 100.0 * best.score))
+            print("search      (train, %d instances)      : mean %+.2f%% vs %s"
+                  % (len(instances), 100.0 * best.score, base_label))
             for name, nn in baseline.items():
-                print("  %-8s NN=%6d  best=%6s  %+6.2f%%"
+                print("  %-8s base=%6d  best=%6s  %+6.2f%%"
                       % (name, int(nn), best.lengths.get(name), 100.0 * best.rel.get(name, 0.0)))
             if validation_rows:
                 mean = sum(r["improvement"] for r in validation_rows) / len(validation_rows)
-                print("validation  (held-out, %d instances)   : mean %+.2f%% vs nearest neighbour"
-                      % (len(validation_rows), mean))
+                print("validation  (held-out, %d instances)   : mean %+.2f%% vs %s"
+                      % (len(validation_rows), mean, base_label))
                 for row in validation_rows:
-                    print("  %-8s NN=%6d  best=%6d  %+6.2f%%"
+                    print("  %-8s base=%6d  best=%6d  %+6.2f%%"
                           % (row["instance"], row["nn"], row["ours"], row["improvement"]))
                 print("            (never used for selection; only reported)")
             if validation_trace:
@@ -571,10 +599,10 @@ def main(argv=None) -> int:
                          validation_trace[-1]["validation_mean"],
                          validation_trace[0]["search_score"],
                          validation_trace[-1]["search_score"]))
-            print("Best code  : %s" % (run_dir / "best_priority.py",))
+            print("Best code  : %s" % (run_dir / best_name,))
         print("Report     : %s" % (run_dir / "report.md",))
         print('Solve with : python -m funsearch_tsp.solve --program "%s" --group search'
-              % (run_dir / "best_priority.py",))
+              % (run_dir / best_name,))
     return 0
 
 
