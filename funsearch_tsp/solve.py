@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import evaluate, sandbox, skeleton, skeletons, tsp
+from . import evaluate, sandbox, skeleton, skeleton_ils, skeletons, tsp
 from .prompt import extract_priority
 
 #: Published TSPLIB optima (used only to report the gap; never used for search).
@@ -74,7 +74,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="python -m funsearch_tsp.solve",
         description="Solve TSP instances with a FunSearch-generated priority function.",
     )
-    parser.add_argument("--program", required=True, help="path to the generated .py file")
+    parser.add_argument("--program", default=None,
+                        help="path to the generated .py file (or use --baseline)")
+    parser.add_argument("--baseline",
+                        choices=sorted(skeleton_ils.BASELINES) + list(skeleton_ils.EXTRA_BASELINES),
+                        default=None,
+                        help="evaluate one of the built-in destroy operators (random | worst | "
+                             "related) instead of a generated program, or 'lsonly' for the A2 "
+                             "ablation (nearest neighbour + 2-opt/Or-opt, no ILS loop); the "
+                             "reference operator of the score is still 'random'")
     parser.add_argument("--instances", nargs="+", default=None,
                         help="instance names or paths (default: every .tsp in --data-dir)")
     parser.add_argument("--group", default=None,
@@ -99,6 +107,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     if args.group is not None and args.instances is not None:
         parser.error("--group and --instances are alternatives; pass only one")
+    if (args.program is None) == (args.baseline is None):
+        parser.error("pass exactly one of --program or --baseline")
     return args
 
 
@@ -179,19 +189,35 @@ def discover_instances(data_dir=None) -> List[str]:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    raw = Path(args.program).read_text(encoding="utf-8", errors="replace")
-    if args.skeleton == "auto":
-        skel = skeletons.detect(raw)
-        if skel is None:
-            raise SystemExit("cannot tell which skeleton %s belongs to; pass --skeleton "
-                             "greedy|ils" % (args.program,))
+    source_override = None
+    if args.baseline == "lsonly":
+        skel = skeleton_ils
+        code = None
+        source_override = skeleton_ils.local_search_only_source()
+        method_label = "ls-only"
+        origin = "A2 ablation: nearest neighbour + 2-opt/Or-opt, no ILS loop"
+    elif args.baseline is not None:
+        skel = skeleton_ils
+        code = skeleton_ils.BASELINES[args.baseline].strip()
+        method_label = args.baseline
+        origin = "built-in baseline operator '%s'" % (args.baseline,)
     else:
-        skel = skeletons.get(args.skeleton)
-    code = load_priority_code(args.program, skel=skel)
-    try:
-        sandbox.validate_candidate(code, skel=skel)
-    except sandbox.ProgramRejected as exc:
-        raise SystemExit("the program in %s failed the static checks: %s" % (args.program, exc))
+        raw = Path(args.program).read_text(encoding="utf-8", errors="replace")
+        if args.skeleton == "auto":
+            skel = skeletons.detect(raw)
+            if skel is None:
+                raise SystemExit("cannot tell which skeleton %s belongs to; pass --skeleton "
+                                 "greedy|ils" % (args.program,))
+        else:
+            skel = skeletons.get(args.skeleton)
+        code = load_priority_code(args.program, skel=skel)
+        method_label = "FunSearch"
+        origin = str(args.program)
+    if code is not None:
+        try:
+            sandbox.validate_candidate(code, skel=skel)
+        except sandbox.ProgramRejected as exc:
+            raise SystemExit("%s failed the static checks: %s" % (origin, exc))
 
     if args.group is not None:
         names = instances_for_group(args.group, args.split)
@@ -199,13 +225,13 @@ def main(argv=None) -> int:
         names = args.instances or discover_instances(args.data_dir)
     instances = tsp.load_instances(names, args.data_dir)
     payload = evaluate.instances_payload(instances)
-    source = skel.build_source(code)
+    source = source_override if source_override is not None else skel.build_source(code)
 
     baseline = evaluate.compute_baseline(
         payload, timeout=max(60.0, args.timeout), skel=skel)
     base_label = "random-destruction ILS" if getattr(skel, "NAME", "") == "ils" else "NN"
-    print("skeleton: %s (evolves %s); baseline: %s"
-          % (skel.NAME, skel.EVOLVED_NAME, base_label))
+    print("skeleton: %s (evolves %s); baseline: %s" % (skel.NAME, skel.EVOLVED_NAME, base_label))
+    print("program : %s" % (origin,))
 
     # Evaluate in one batch first (fast path). A generated priority function can
     # be super-quadratic in n, so a single 1800-city instance may need more wall
@@ -230,7 +256,7 @@ def main(argv=None) -> int:
     rows = []  # type: List[dict]
     known_optima = load_known_optima()
     print("%-10s %5s %9s %9s %10s %9s %9s" %
-          ("instance", "n", base_label, "FunSearch", "improve", "optimum", "gap"))
+          ("instance", "n", base_label, method_label, "improve", "optimum", "gap"))
     print("-" * 68)
     gaps = []  # type: List[float]
     for inst in instances:

@@ -320,6 +320,38 @@ def build_source(destroy_code: str) -> str:
     return source
 
 
+#: Ablation "A2": nearest neighbour + 2-opt/Or-opt only, *no* ILS loop.
+#: It exposes ``solve`` (which the sandbox prefers over ``ils``) so the same
+#: evaluation path measures the skeleton's local search on its own. The dummy
+#: ``destroy_priority`` is never called and only satisfies the loader.
+LOCAL_SEARCH_ONLY = (
+    SKELETON_SOURCE.rstrip()
+    + '''
+
+
+# ---- A2 ablation: no ILS loop, only the local search ----
+def destroy_priority(features):
+    """Never called: this variant stops after the local search."""
+    return features["noise"]
+
+
+def solve(problem, priority):
+    """Nearest-neighbour construction followed by 2-opt + Or-opt."""
+    return local_search(greedy_construct(problem), problem)
+'''
+)
+
+#: Extra ablation names accepted by ``solve --baseline`` besides BASELINES.
+EXTRA_BASELINES = ("lsonly",)
+
+
+def local_search_only_source() -> str:
+    """Module source of the A2 ablation (NN + local search, no destruction)."""
+    source = LOCAL_SEARCH_ONLY
+    compile(source, "<local search only>", "exec")
+    return source
+
+
 def check_signature(destroy_code: str) -> None:
     """Reject candidates that do not define ``destroy_priority(features)``."""
     tree = ast.parse(destroy_code)

@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
+
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 
@@ -76,6 +78,7 @@ class ChatLLM(object):
         self.total_calls = 0
         self.total_tokens = 0
         self.last_usage = {}
+        self.last_retries = 0
 
     # ------------------------------------------------------------------ #
     def _post(self, prompt: str) -> str:
@@ -129,7 +132,12 @@ class ChatLLM(object):
         """Return one completion, retrying transient failures with backoff."""
         delay = 2.0
         last_error = ""
+        self.last_usage = {}
+        self.last_retries = 0
+        # Every *attempt* is billed by the provider, not only the successful one,
+        # so the retry counter is part of the per-call log.
         for attempt in range(1, self.max_retries + 1):
+            self.last_retries = attempt - 1
             try:
                 self.total_calls += 1
                 text = self._post(prompt)
@@ -232,6 +240,42 @@ _DESTROY_DENSE = '''def destroy_priority_v2(features):
 '''
 
 
+class RandomLinearSampler(object):
+    """Control group: ignore the prompt, emit a *random* linear combination.
+
+    This is the "same budget, same feature space, no intelligence" sampler the
+    paper-style ratio needs: any gain of the evolved program over this sampler
+    can be attributed to the search direction the LLM proposed, not merely to
+    "trying N candidates and keeping the best one".
+    """
+
+    def __init__(self, skeleton: str = "ils", seed: int = 0, verbose: bool = True) -> None:
+        if skeleton != "ils":
+            raise ValueError("the random-weight control only makes sense for the ILS skeleton")
+        self.skeleton = skeleton
+        self.seed = int(seed)
+        self.verbose = verbose
+        self.calls = 0
+        self.total_calls = 0
+        self.total_tokens = 0
+        self.last_usage = {}
+        self.last_retries = 0
+
+    FEATURES = ("gap", "saving", "related", "density", "angle", "pos", "noise")
+
+    def generate(self, prompt: str) -> str:
+        self.total_calls += 1
+        rng = np.random.default_rng([self.seed, self.calls])
+        self.calls += 1
+        weights = rng.normal(size=len(self.FEATURES))
+        terms = " + ".join(
+            "%.4f * features[%r]" % (float(w), name)
+            for w, name in zip(weights, self.FEATURES)
+        )
+        code = "def destroy_priority(features):\n    return %s\n" % (terms,)
+        return "```python\n%s```\n" % (code,)
+
+
 class MockLLM(object):
     """Deterministic stand-in for the real LLM (no network, no cost).
 
@@ -246,6 +290,7 @@ class MockLLM(object):
         self.total_calls = 0
         self.total_tokens = 0
         self.last_usage = {}
+        self.last_retries = 0
 
     def _next_code(self) -> str:
         step = self.calls

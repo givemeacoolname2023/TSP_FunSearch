@@ -89,6 +89,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--t-program", type=float, default=0.1, help="program-length temperature")
     parser.add_argument("--temperature", type=float, default=1.0, help="LLM sampling temperature")
     parser.add_argument("--max-tokens", type=int, default=1600)
+    parser.add_argument("--sampler", choices=["llm", "random-linear"], default="llm",
+                        help="'llm' (default) asks the model for the next program; "
+                             "'random-linear' is the control group: same budget, same feature "
+                             "space, but the weights of the linear combination are drawn at "
+                             "random, so any gain of the LLM run over it is attributable to the "
+                             "search direction rather than to trying N candidates")
     parser.add_argument("--thinking", choices=["off", "on"], default="off",
                         help="'off' (default) sends thinking={'type': 'disabled'}; required for "
                              "reasoning models such as deepseek-flash, which otherwise spend the "
@@ -114,6 +120,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 def make_llm(args: argparse.Namespace):
     if args.mock:
         return llm.MockLLM(verbose=not args.quiet, skeleton=args.skeleton)
+    if args.sampler == "random-linear":
+        return llm.RandomLinearSampler(
+            skeleton=args.skeleton, seed=args.seed, verbose=not args.quiet)
     llm.load_env_file(args.env_file)
     model = args.model or os.environ.get("DEEPSEEK_MODEL") or llm.DEFAULT_MODEL
     base_url = args.base_url or os.environ.get("DEEPSEEK_BASE_URL") or llm.DEFAULT_BASE_URL
@@ -126,6 +135,17 @@ def make_llm(args: argparse.Namespace):
         verbose=not args.quiet,
         extra_body=extra_body,
     )
+
+
+def usage_fields(client) -> dict:
+    """Billing/retry fields for one generation call (TA: log every billed token)."""
+    usage = getattr(client, "last_usage", None) or {}
+    return {
+        "tokens": int(usage.get("total_tokens", 0) or 0),
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "retries": int(getattr(client, "last_retries", 0) or 0),
+    }
 
 
 def prepare_run_dir(args: argparse.Namespace) -> Path:
@@ -176,6 +196,15 @@ def write_report(
                  % (db.num_islands, db.num_sampled, len(ok_attempts), getattr(llm_client, "total_calls", 0)))
     if getattr(llm_client, "total_tokens", 0):
         lines.append("- tokens used: %d" % (llm_client.total_tokens,))
+    billed = sum(int(a.get("tokens", 0) or 0) for a in attempts)
+    retries = sum(int(a.get("retries", 0) or 0) for a in attempts)
+    duplicates_billed = [a for a in attempts if a.get("duplicate")]
+    dup_tokens = sum(int(a.get("tokens", 0) or 0) for a in duplicates_billed)
+    lines.append("- billed generation calls: %d, tokens logged per call: %d, retries: %d"
+                 % (len(attempts), billed, retries))
+    lines.append("- of those, %d call(s) produced code that was already evaluated and cost "
+                 "%d tokens: the code cache saves the *evaluation*, never the generation"
+                 % (len(duplicates_billed), dup_tokens))
     lines.append("- baseline (%s) tour lengths: %s"
                  % (base_label, ", ".join("%s=%d" % (k, int(v)) for k, v in baseline.items()),))
     lines.append("")
@@ -349,8 +378,10 @@ def main(argv=None) -> int:
         "t_cluster": args.t_cluster,
         "t_program": args.t_program,
         "llm_temperature": args.temperature,
+        "sampler": "mock" if args.mock else args.sampler,
         "thinking": args.thinking,
-        "model": getattr(client, "model", "mock"),
+        "model": ("random-linear" if args.sampler == "random-linear"
+                  else getattr(client, "model", "mock")),
         "base_url": getattr(client, "base_url", ""),
         "mock": bool(args.mock),
         "python": sys.version.split()[0],
@@ -371,7 +402,14 @@ def main(argv=None) -> int:
         if skel.NAME == "ils":
             print("  ils       : T=%d rounds, k=%d cities removed per round"
                   % (skeleton_ils.DEFAULT_ITERATIONS, skeleton_ils.DEFAULT_K))
-        print("  llm       : %s" % (config["model"] if not args.mock else "mock (offline)",))
+        print("  sampler   : %s" % (config["sampler"],))
+        if args.mock:
+            llm_label = "mock (offline)"
+        elif args.sampler == "random-linear":
+            llm_label = "none (control: random weights)"
+        else:
+            llm_label = config["model"]
+        print("  llm       : %s" % (llm_label,))
         print("  train     : %s" % (", ".join("%s n=%d" % (i.name, i.n) for i in instances),))
         print("  islands   : %d, k=%d, programs=%d, budget=%.0fs"
               % (args.islands, args.k, args.n_programs, args.time_budget))
@@ -441,6 +479,7 @@ def main(argv=None) -> int:
                         "cached": False, "elapsed": 0.0, "parents": [p.program_id for p in parents],
                         "time": time.time() - started,
                     }
+                    record.update(usage_fields(client))
                     attempts.append(record)
                     log.write(json.dumps(record, ensure_ascii=False) + "\n")
                     log.flush()
@@ -457,11 +496,13 @@ def main(argv=None) -> int:
                         "parents": [p.program_id for p in parents],
                         "time": time.time() - started,
                     }
+                    record.update(usage_fields(client))
                     attempts.append(record)
                     log.write(json.dumps(record, ensure_ascii=False) + "\n")
                     log.flush()
                     continue
                 consecutive_llm_errors = 0
+                usage = usage_fields(client)
 
                 key = sandbox.code_key(code, skel.NAME)
                 duplicate = key in seen
@@ -516,6 +557,7 @@ def main(argv=None) -> int:
                     "time": round(time.time() - started, 2),
                     "code": code,
                 }
+                record.update(usage)
                 attempts.append(record)
                 log.write(json.dumps(record, ensure_ascii=False) + "\n")
                 log.flush()
