@@ -29,8 +29,9 @@ for path in (ROOT, TOOLS):
         sys.path.insert(0, str(path))
 
 import summarize  # noqa: E402  (same directory)
+from funsearch_tsp import construct  # noqa: E402
 
-BASELINE_METHODS = ("lsonly", "random", "worst", "related")
+BASELINE_METHODS = tuple(["lsonly", "random", "worst", "related"] + list(construct.LABELS))
 GROUPS = ("search", "validation", "final")
 
 LLM_PATTERN = re.compile(r"_ils_s(\d+)$")
@@ -62,13 +63,19 @@ def discover(runs_dir):
     out = {"baselines": {}, "llm": {}, "ctl": {}}
 
     for group in GROUPS:
-        base = runs_dir / ("baselines_%s" % (group,))
+        # Two layouts are accepted, because tools/eval_baselines.py uses
+        # <work-dir>/<group> for a multi-group run and <work-dir> for a single
+        # one:   runs/baselines_<group>/   and   runs/baselines/<group>/
+        candidates = [runs_dir / ("baselines_%s" % (group,)), runs_dir / "baselines" / group]
         found = {}
-        if base.is_dir():
+        for base in candidates:
+            if not base.is_dir():
+                continue
             for method in BASELINE_METHODS:
-                hits = list(base.glob("%s_*.csv" % (method,)))
-                if hits:
-                    found[method] = newest(hits)
+                for hit in base.glob("%s_*.csv" % (method,)):
+                    previous = found.get(method)
+                    if previous is None or hit.name > previous.name:
+                        found[method] = hit
         out["baselines"][group] = found
 
     for key, pattern in (("llm", LLM_PATTERN), ("ctl", CTL_PATTERN)):

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import evaluate, sandbox, skeleton, skeleton_ils, skeletons, tsp
+from . import construct, evaluate, sandbox, skeleton, skeleton_ils, skeletons, tsp
 from .prompt import extract_priority
 
 #: Published TSPLIB optima (used only to report the gap; never used for search).
@@ -77,12 +77,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--program", default=None,
                         help="path to the generated .py file (or use --baseline)")
     parser.add_argument("--baseline",
-                        choices=sorted(skeleton_ils.BASELINES) + list(skeleton_ils.EXTRA_BASELINES),
+                        choices=(sorted(skeleton_ils.BASELINES)
+                                 + list(skeleton_ils.EXTRA_BASELINES)
+                                 + list(construct.LABELS)),
                         default=None,
-                        help="evaluate one of the built-in destroy operators (random | worst | "
-                             "related) instead of a generated program, or 'lsonly' for the A2 "
-                             "ablation (nearest neighbour + 2-opt/Or-opt, no ILS loop); the "
-                             "reference operator of the score is still 'random'")
+                        help="evaluate a built-in method instead of a generated program: the "
+                             "destroy operators (random | worst | related), the A2 ablation "
+                             "'lsonly' (nearest neighbour + 2-opt/Or-opt, no ILS loop), or a "
+                             "constructive baseline (nearest-/cheapest-/farthest-ins, with an "
+                             "optional -ls suffix that runs 2-opt/Or-opt afterwards)")
     parser.add_argument("--instances", nargs="+", default=None,
                         help="instance names or paths (default: every .tsp in --data-dir)")
     parser.add_argument("--group", default=None,
@@ -196,6 +199,12 @@ def main(argv=None) -> int:
         source_override = skeleton_ils.local_search_only_source()
         method_label = "ls-only"
         origin = "A2 ablation: nearest neighbour + 2-opt/Or-opt, no ILS loop"
+    elif args.baseline in construct.LABELS:
+        skel = skeleton_ils
+        code = None
+        source_override = construct.build_source(args.baseline)
+        method_label = args.baseline
+        origin = "constructive baseline: %s" % (construct.DESCRIPTIONS[args.baseline],)
     elif args.baseline is not None:
         skel = skeleton_ils
         code = skeleton_ils.BASELINES[args.baseline].strip()

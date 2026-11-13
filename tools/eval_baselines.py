@@ -26,9 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from funsearch_tsp import solve, skeleton_ils  # noqa: E402
+from funsearch_tsp import construct, solve, skeleton_ils  # noqa: E402
 
 RUNS_DIR = ROOT / "runs"
+
+#: Every method this tool can measure, in the order they should appear in a table.
+ALL_METHODS = (["lsonly", "random", "worst", "related"] + list(construct.LABELS))
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -39,11 +42,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--group", nargs="+", default=["final"],
                         help="one or more split groups to evaluate in a single command: "
                              "search validation final transfer")
-    parser.add_argument("--baselines", nargs="+",
-                        default=["lsonly", "random", "worst", "related"],
-                        choices=["lsonly"] + sorted(skeleton_ils.BASELINES),
-                        help="methods to measure; 'lsonly' is the A2 ablation "
-                             "(nearest neighbour + 2-opt/Or-opt, no ILS loop)")
+    parser.add_argument("--baselines", nargs="+", default=list(ALL_METHODS),
+                        choices=list(ALL_METHODS),
+                        help="methods to measure (default: all of them); 'lsonly' is the A2 "
+                             "ablation, '*-ins' are the constructive insertion baselines and "
+                             "'*-ins-ls' the same followed by 2-opt/Or-opt")
     parser.add_argument("--include", nargs="+", default=None, metavar="LABEL=CSV",
                         help="add an existing results.csv to the same table (single --group "
                              "only), e.g. llm=runs/20261111-001309_ils01/final.csv")
