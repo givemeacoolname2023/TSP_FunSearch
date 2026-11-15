@@ -106,6 +106,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--skeleton", choices=["auto"] + skeletons.names(), default="auto",
                         help="which frozen skeleton to plug the program into; 'auto' (default) "
                              "reads it off the file: destroy_priority -> ils, priority -> greedy")
+    parser.add_argument("--features", nargs="+", default=None,
+                        help="override the feature subset recorded in the run's config.json")
+    parser.add_argument("--features-scale", choices=["auto", "free", "raw"], default="auto",
+                        help="override the scaling mode; 'auto' (default) takes it from the "
+                             "run's config.json")
     args = parser.parse_args(argv)
 
     if args.group is not None and args.instances is not None:
@@ -143,6 +148,23 @@ def instances_for_group(group, path=None) -> List[str]:
     if not names:
         raise SystemExit("--group %s: the group is empty in %s" % (group, chosen))
     return names
+
+
+def run_config_for(program_path):
+    """(features, scaled) recorded next to a generated program, or defaults.
+
+    ``run.py`` writes ``config.json`` into every run directory, so evaluating a
+    program with the feature configuration it was evolved under needs no extra
+    flags.  A missing or unreadable file falls back to "all features, scale-free".
+    """
+    config_path = Path(program_path).parent / "config.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, False
+    features = data.get("features") or None
+    scaled = str(data.get("features_scale", "free")).lower() == "raw"
+    return features, scaled
 
 
 def load_priority_code(path, skel=None) -> str:
@@ -234,12 +256,30 @@ def main(argv=None) -> int:
         names = args.instances or discover_instances(args.data_dir)
     instances = tsp.load_instances(names, args.data_dir)
     payload = evaluate.instances_payload(instances)
-    source = source_override if source_override is not None else skel.build_source(code)
+
+    # A generated ILS program only makes sense with the feature configuration it
+    # was evolved under; that configuration is recorded next to it in config.json.
+    features, scaled = (None, False)
+    from_program = source_override is None and args.program is not None
+    if from_program and getattr(skel, "NAME", "") == "ils":
+        features, scaled = run_config_for(args.program)
+        if args.features:
+            features = skel.normalize_features(args.features)
+        if args.features_scale != "auto":
+            scaled = args.features_scale == "raw"
+
+    source = (source_override if source_override is not None
+              else evaluate.build_for(skel, code, features, scaled))
 
     baseline = evaluate.compute_baseline(
-        payload, timeout=max(60.0, args.timeout), skel=skel)
+        payload, timeout=max(60.0, args.timeout), skel=skel,
+        features=features, scaled=scaled)
     base_label = "random-destruction ILS" if getattr(skel, "NAME", "") == "ils" else "NN"
     print("skeleton: %s (evolves %s); baseline: %s" % (skel.NAME, skel.EVOLVED_NAME, base_label))
+    if getattr(skel, "NAME", "") == "ils" and from_program:
+        print("features: %s (%s units)"
+              % (", ".join(skel.normalize_features(features)),
+                 "raw" if scaled else "scale-free"))
     print("program : %s" % (origin,))
 
     # Evaluate in one batch first (fast path). A generated priority function can

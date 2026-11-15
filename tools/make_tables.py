@@ -6,18 +6,27 @@
 
 It discovers, by directory naming only:
 
-    runs/baselines_<group>/<method>_*.csv     the four built-in operators
+    runs/baselines_<group>/<method>_*.csv     the built-in operators
+    runs/baselines/<group>/<method>_*.csv     (same, multi-group layout)
     runs/*_ils_s<k>/<group>.csv               one directory per LLM seed
     runs/*_ctl<k>/<group>.csv                 one directory per control seed
+    runs/*_raw_llm<k>/<group>.csv             ... the same in raw distance units
+    runs/*_raw_ctl<k>/<group>.csv
 
 and then calls ``tools/summarize.py`` once per group, so the statistics are
 identical to running it by hand. Everything is printed first (what was found,
 and what is missing) so a stale directory cannot silently be counted as an
 extra "seed".
+
+Free-space and raw-space runs are kept in separate rows (``llm`` vs ``llm-raw``)
+because mixing them into one mean would answer no question at all.  The feature
+scale is read from each run's ``config.json`` and only falls back to the
+directory tag when that file is missing.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -34,8 +43,12 @@ from funsearch_tsp import construct  # noqa: E402
 BASELINE_METHODS = tuple(["lsonly", "random", "worst", "related"] + list(construct.LABELS))
 GROUPS = ("search", "validation", "final")
 
-LLM_PATTERN = re.compile(r"_ils_s(\d+)$")
-CTL_PATTERN = re.compile(r"_ctl(\d+)$")
+#: ``_ils_s0`` (free) and ``_raw_llm0`` (raw distance units) name the same thing.
+LLM_PATTERN = re.compile(r"(?:^|_)(raw_)?(?:ils_s|llm)(\d+)$")
+CTL_PATTERN = re.compile(r"(?:^|_)(raw_)?ctl(\d+)$")
+
+#: label -> (backend, requires raw?) used to name the columns in the table.
+STOCHASTIC = (("llm", "llm", LLM_PATTERN), ("control", "ctl", CTL_PATTERN))
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -49,18 +62,24 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--groups", nargs="+", default=list(GROUPS), choices=GROUPS)
     parser.add_argument("--metric", choices=["gap", "length"], default="gap")
     parser.add_argument("--no-pairs", action="store_true",
-                        help="skip the llm-vs-control / llm-vs-related paired tests")
+                        help="skip the paired tests")
     return parser.parse_args(argv)
 
 
-def newest(paths):
-    return sorted(paths, key=lambda p: p.name)[-1]
+def scale_of(directory: Path, match) -> str:
+    """'raw' or 'free' for one run directory (config.json wins over the tag)."""
+    config = directory / "config.json"
+    try:
+        data = json.loads(config.read_text(encoding="utf-8"))
+        return "raw" if str(data.get("features_scale", "free")).lower() == "raw" else "free"
+    except (OSError, ValueError):
+        return "raw" if match.group(1) else "free"
 
 
 def discover(runs_dir):
-    """{baselines: {group: {method: path}}, llm: {group: [paths]}, ctl: {...}}."""
+    """{baselines: {group: {method: path}}, stochastic: {group: {label: [paths]}}}."""
     runs_dir = Path(runs_dir)
-    out = {"baselines": {}, "llm": {}, "ctl": {}}
+    out = {"baselines": {}, "stochastic": {group: {} for group in GROUPS}}
 
     for group in GROUPS:
         # Two layouts are accepted, because tools/eval_baselines.py uses
@@ -78,17 +97,24 @@ def discover(runs_dir):
                         found[method] = hit
         out["baselines"][group] = found
 
-    for key, pattern in (("llm", LLM_PATTERN), ("ctl", CTL_PATTERN)):
-        for group in GROUPS:
-            entries = []
-            for directory in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+    directories = sorted(p for p in runs_dir.iterdir() if p.is_dir()) \
+        if runs_dir.is_dir() else []
+    for group in GROUPS:
+        buckets = {}
+        for label, _key, pattern in STOCHASTIC:
+            for directory in directories:
                 match = pattern.search(directory.name)
                 if not match:
                     continue
                 csv_path = directory / ("%s.csv" % (group,))
-                if csv_path.is_file():
-                    entries.append((int(match.group(1)), directory.name, csv_path))
-            out[key][group] = [path for _, _, path in sorted(entries)]
+                if not csv_path.is_file():
+                    continue
+                column = label if scale_of(directory, match) == "free" else label + "-raw"
+                buckets.setdefault(column, []).append((int(match.group(2)), csv_path))
+        out["stochastic"][group] = {
+            column: [path for _, path in sorted(items)]
+            for column, items in buckets.items()
+        }
     return out
 
 
@@ -96,20 +122,18 @@ def report(found, runs_dir):
     print("runs dir : %s" % (runs_dir,))
     for group in GROUPS:
         base = found["baselines"][group]
-        print("  %-10s baselines: %-40s llm seeds: %d   control seeds: %d"
-              % (group,
-                 ", ".join(sorted(base)) or "(missing)",
-                 len(found["llm"][group]),
-                 len(found["ctl"][group])))
+        seeds = found["stochastic"][group]
+        detail = ", ".join("%s=%d" % (name, len(paths)) for name, paths in sorted(seeds.items()))
+        print("  %-10s baselines: %-52s seeds: %s"
+              % (group, ", ".join(sorted(base)) or "(missing)", detail or "(none)"))
     missing = []
     for group in GROUPS:
         for method in BASELINE_METHODS:
             if method not in found["baselines"][group]:
                 missing.append("baselines %s/%s" % (group, method))
-        if not found["llm"][group]:
-            missing.append("llm/%s" % (group,))
-        if not found["ctl"][group]:
-            missing.append("control/%s" % (group,))
+        for column in ("llm", "control"):
+            if column not in found["stochastic"][group]:
+                missing.append("%s/%s" % (column, group))
     if missing:
         print("  ! missing: %s" % (", ".join(missing),))
 
@@ -121,16 +145,24 @@ def build_argv(found, group, out_path, args):
     for method in BASELINE_METHODS:
         if method in base:
             argv += ["--method", method, str(base[method])]
-    llm = found["llm"][group]
-    ctl = found["ctl"][group]
-    if llm:
-        argv += ["--method", "llm"] + [str(p) for p in llm]
-    if ctl:
-        argv += ["--method", "control"] + [str(p) for p in ctl]
-    if not args.no_pairs and llm and ctl:
-        argv += ["--pair", "llm", "control"]
-    if not args.no_pairs and llm and "related" in base:
-        argv += ["--pair", "llm", "related"]
+    seeds = found["stochastic"][group]
+    for column in ("llm", "control", "llm-raw", "control-raw"):
+        if column in seeds:
+            argv += ["--method", column] + [str(p) for p in seeds[column]]
+
+    if not args.no_pairs:
+        wanted = [
+            ("llm", "control"),        # does the LLM beat random search?
+            ("llm", "related"),        # does it beat the strongest hand-made operator?
+            ("llm", "llm-raw"),        # scale-free ablation, main method
+            ("control", "control-raw"),  # scale-free ablation, control
+        ]
+        available = set(seeds)
+        for left, right in wanted:
+            if left in available and right in available:
+                argv += ["--pair", left, right]
+            elif left in available and right in base:
+                argv += ["--pair", left, right]
     argv += ["--out", str(out_path)]
     return argv
 
@@ -149,7 +181,7 @@ def main(argv=None) -> int:
     written = []
     for group in args.groups:
         methods = list(found["baselines"][group])
-        if not found["llm"][group] and not found["ctl"][group] and not methods:
+        if not found["stochastic"][group] and not methods:
             print("\n! %s: nothing to summarise, skipped" % (group,))
             continue
         out_path = out_dir / ("summary_%s.md" % (group,))

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -203,10 +204,14 @@ _FARTHEST_TEMPLATE = '''def priority_v2(current, candidates, visited, dist, coor
 '''
 
 
-_DESTROY_RANDOM = '''def destroy_priority(features):
+_DESTROY_RANDOM = _DESTROY_SEED = '''def destroy_priority(features):
     """Random destruction (the trivial seed)."""
     return features["noise"]
 '''
+
+#: Every `features["..."]` key a mock template refers to, used to keep an
+#: ablation run from emitting code that indexes a removed feature.
+_FEATURE_REF = re.compile(r"features\[[\"']([a-z_]+)[\"']\]")
 
 _DESTROY_WORST = '''def destroy_priority_v2(features):
     """Worst removal: rip out the cities whose removal saves the most length."""
@@ -249,9 +254,12 @@ class RandomLinearSampler(object):
     "trying N candidates and keeping the best one".
     """
 
-    def __init__(self, skeleton: str = "ils", seed: int = 0, verbose: bool = True) -> None:
+    def __init__(self, skeleton: str = "ils", seed: int = 0, verbose: bool = True,
+                 features=None) -> None:
         if skeleton != "ils":
             raise ValueError("the random-weight control only makes sense for the ILS skeleton")
+        from . import skeleton_ils  # local import keeps the module dependency-free
+
         self.skeleton = skeleton
         self.seed = int(seed)
         self.verbose = verbose
@@ -260,8 +268,10 @@ class RandomLinearSampler(object):
         self.total_tokens = 0
         self.last_usage = {}
         self.last_retries = 0
-
-    FEATURES = ("gap", "saving", "related", "density", "angle", "pos", "noise")
+        # Only the features enabled for this run are ever sampled, so a feature
+        # ablation and its control see exactly the same search space.
+        self.FEATURES = skeleton_ils.normalize_features(features)
+        self.features = self.FEATURES
 
     def generate(self, prompt: str) -> str:
         self.total_calls += 1
@@ -283,7 +293,8 @@ class MockLLM(object):
     return *different* programs and the islands/clusters actually fill up.
     """
 
-    def __init__(self, verbose: bool = True, skeleton: str = "greedy") -> None:
+    def __init__(self, verbose: bool = True, skeleton: str = "greedy",
+                 features=None) -> None:
         self.verbose = verbose
         self.skeleton = skeleton
         self.calls = 0
@@ -291,6 +302,14 @@ class MockLLM(object):
         self.total_tokens = 0
         self.last_usage = {}
         self.last_retries = 0
+        self.features = None if features is None else tuple(features)
+
+    def _allowed(self, code: str) -> bool:
+        """Keep only templates that reference features this run actually exposes."""
+        if self.features is None:
+            return True
+        used = set(_FEATURE_REF.findall(code))
+        return used.issubset(set(self.features))
 
     def _next_code(self) -> str:
         step = self.calls
@@ -298,16 +317,19 @@ class MockLLM(object):
         weight = "%.2f" % (0.05 + 0.02 * ((step // 5) % 45),)
         if self.skeleton == "ils":
             # 5 destroy operators x 45 weights, so a mock run stays unique a while
+            families = [
+                _DESTROY_WORST,
+                _DESTROY_RELATED,
+                _DESTROY_MIX % (weight, "%.2f" % (1.0 - float(weight),)),
+                _DESTROY_ANGLE % (weight,),
+                _DESTROY_DENSE % (weight,),
+            ]
             family = step % 5
-            if family == 0:
-                return _DESTROY_WORST
-            if family == 1:
-                return _DESTROY_RELATED
-            if family == 2:
-                return _DESTROY_MIX % (weight, "%.2f" % (1.0 - float(weight),))
-            if family == 3:
-                return _DESTROY_ANGLE % (weight,)
-            return _DESTROY_DENSE % (weight,)
+            code = families[family]
+            if not self._allowed(code):
+                # fall back to the seed (random destruction), which only needs `noise`
+                code = _DESTROY_SEED
+            return code
         family = step % 5
         if family == 0:
             return _LOOKAHEAD_TEMPLATE % (weight,)

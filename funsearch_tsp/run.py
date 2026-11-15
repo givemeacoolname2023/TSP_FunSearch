@@ -57,6 +57,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="which frozen skeleton to search on: 'ils' (default, the main "
                              "experiment: evolve destroy_priority inside iterated local search) "
                              "or 'greedy' (the preliminary construction baseline: evolve priority)")
+    parser.add_argument("--features", nargs="+", default=None,
+                        help="subset of the frozen feature set to expose to the evolved "
+                             "program (default: all of gap saving related density angle pos "
+                             "noise). Used for feature ablation; 'noise' is always kept")
+    parser.add_argument("--features-scale", choices=["free", "raw"], default="free",
+                        help="'free' (default) divides the distance-like features by the "
+                             "average edge length d_bar, making them scale-free; 'raw' keeps "
+                             "raw distance units, which is the ablation that tests whether "
+                             "scale-free features help cross-scale transfer")
     parser.add_argument("--train", nargs="+", default=None,
                         help="training instances (names in tsp_files/ or paths); "
                              "default: the `search` group of tsp_files/data/split.json")
@@ -119,10 +128,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def make_llm(args: argparse.Namespace):
     if args.mock:
-        return llm.MockLLM(verbose=not args.quiet, skeleton=args.skeleton)
+        return llm.MockLLM(verbose=not args.quiet, skeleton=args.skeleton,
+                           features=args.features)
     if args.sampler == "random-linear":
         return llm.RandomLinearSampler(
-            skeleton=args.skeleton, seed=args.seed, verbose=not args.quiet)
+            skeleton=args.skeleton, seed=args.seed, verbose=not args.quiet,
+            features=args.features)
     llm.load_env_file(args.env_file)
     model = args.model or os.environ.get("DEEPSEEK_MODEL") or llm.DEFAULT_MODEL
     base_url = args.base_url or os.environ.get("DEEPSEEK_BASE_URL") or llm.DEFAULT_BASE_URL
@@ -323,6 +334,10 @@ def main(argv=None) -> int:
     run_dir = prepare_run_dir(args)
     rng = np.random.default_rng(args.seed)
     skel = skeletons.get(args.skeleton)
+    features = None
+    if getattr(skel, "NAME", "") == "ils" and args.features:
+        features = skeleton_ils.normalize_features(args.features)
+    scaled = getattr(skel, "NAME", "") == "ils" and args.features_scale == "raw"
 
     instances = tsp.load_instances(args.train, args.data_dir)
     payload = evaluate.instances_payload(instances)
@@ -345,9 +360,11 @@ def main(argv=None) -> int:
         if not validation_baseline:
             validation_baseline.update(
                 evaluate.compute_baseline(
-                    validation_payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel))
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2),
+                    skel=skel, features=features, scaled=scaled))
         ok, result, _ = sandbox.run_source(
-            skel.build_source(code), validation_payload, timeout=args.eval_timeout)
+            evaluate.build_for(skel, code, features, scaled), validation_payload,
+            timeout=args.eval_timeout)
         if not ok:
             if not args.quiet:
                 print("  ! held-out probe failed: %s" % (result,))
@@ -360,13 +377,16 @@ def main(argv=None) -> int:
         return sum(scores) / len(scores)
 
     client = make_llm(args)
-    cache = sandbox.ResultCache(run_dir / "cache.json", namespace=skel.NAME)
+    cache = sandbox.ResultCache(
+        run_dir / "cache.json", namespace=evaluate.feature_scope(skel, features, scaled))
 
     config = {
         "argv": sys.argv[1:] if argv is None else list(argv),
         "run_dir": str(run_dir),
         "skeleton": skel.NAME,
         "evolved_function": skel.EVOLVED_NAME,
+        "features": list(features) if features else list(getattr(skel, "FEATURES", ())),
+        "features_scale": "raw" if scaled else "free",
         "train": train_names,
         "validation": [i.name for i in validation_instances],
         "islands": args.islands,
@@ -416,9 +436,11 @@ def main(argv=None) -> int:
 
     started = time.time()
     baseline = evaluate.compute_baseline(
-        payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel)
+        payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel,
+        features=features, scaled=scaled)
     seed_eval = evaluate.evaluate_program(
-        skel.SEED, payload, baseline, timeout=args.eval_timeout, skel=skel
+        skel.SEED, payload, baseline, timeout=args.eval_timeout, skel=skel,
+        features=features, scaled=scaled
     )
     if not seed_eval.ok:  # pragma: no cover - the seed is our own code
         raise RuntimeError("seed program failed: %s" % (seed_eval.error,))
@@ -466,7 +488,8 @@ def main(argv=None) -> int:
 
                 attempt += 1
                 island_id, parents = db.sample()
-                prompt_text = build_prompt(parents, train_names, baseline, attempt, skel=skel)
+                prompt_text = build_prompt(parents, train_names, baseline, attempt, skel=skel,
+                                          features=features, scaled=scaled)
                 try:
                     reply = client.generate(prompt_text)
                     code = extract_priority(reply, skel=skel)
@@ -507,7 +530,8 @@ def main(argv=None) -> int:
                 key = sandbox.code_key(code, skel.NAME)
                 duplicate = key in seen
                 evaluation = evaluate.evaluate_program(
-                    code, payload, baseline, timeout=args.eval_timeout, cache=cache, skel=skel
+                    code, payload, baseline, timeout=args.eval_timeout, cache=cache,
+                    skel=skel, features=features, scaled=scaled
                 )
                 seen.add(key)
                 consecutive_duplicates = consecutive_duplicates + 1 if duplicate else 0
@@ -594,9 +618,11 @@ def main(argv=None) -> int:
         if not validation_baseline:
             validation_baseline.update(
                 evaluate.compute_baseline(
-                    validation_payload, timeout=max(60.0, args.eval_timeout * 2), skel=skel))
+                    validation_payload, timeout=max(60.0, args.eval_timeout * 2),
+                    skel=skel, features=features, scaled=scaled))
         ok, result, _ = sandbox.run_source(
-            skel.build_source(best.code), validation_payload, timeout=args.eval_timeout
+            evaluate.build_for(skel, best.code, features, scaled), validation_payload,
+            timeout=args.eval_timeout
         )
         if ok:
             for inst in validation_instances:

@@ -29,8 +29,36 @@ DEFAULT_ITERATIONS = 100
 DEFAULT_K = 10
 LOCAL_SEARCH_SEGMENTS = 3  # Or-opt segment lengths 1..3
 
+#: The frozen feature set.  Every feature is either dimensionless by
+#: construction (gap, angle, pos, noise) or divided by the current average edge
+#: length d_bar = L/n (saving, related, density), which is what makes a program
+#: evolved on 50-city instances behave the same on 300-city ones.
+FEATURES = ("gap", "saving", "related", "density", "angle", "pos", "noise")
+
+#: Features that are part of the *scaling* argument (the other four are
+#: dimensionless anyway, so the "raw" variant only changes these three).
+SCALED_FEATURES = ("saving", "related", "density")
+
+#: The trivial seed program reads this one, so it can never be ablated away.
+ALWAYS_ON = ("noise",)
+
+#: One-line description per feature, used by the prompt and the docs.
+FEATURE_HELP = {
+    "gap": "(d(prev,i) + d(i,next)) / d(prev,next), always >= 1",
+    "saving": "(d(prev,i) + d(i,next) - d(prev,next)) / d_bar",
+    "related": "d(seed, i) / d_bar, distance to a random seed city",
+    "density": "mean distance to the 5 nearest cities / d_bar",
+    "angle": "cos(prev->i, i->next), in [-1, 1]",
+    "pos": "(position(i) - position(seed)) / n, in [-1, 1]",
+    "noise": "U[0, 1), freshly drawn every ILS round",
+}
+
 SKELETON_SOURCE = '''"""Frozen ILS skeleton -- only `destroy_priority` is evolved."""
 import numpy as np
+
+# ---- feature configuration (build_source overrides these two lines) ----
+ENABLED_FEATURES = ("gap", "saving", "related", "density", "angle", "pos", "noise")
+SCALE_FREE = True
 
 
 def tour_length(tour, dist):
@@ -203,15 +231,17 @@ def features_of(tour, problem, rng):
     position[tour] = np.arange(n, dtype=float)
     seed_city = int(rng.integers(n))
 
-    return {
+    scale = d_bar if SCALE_FREE else 1.0
+    every = {
         "gap": _by_city(tour, (d_prev + d_next) / np.maximum(d_close, 1e-9)),
-        "saving": _by_city(tour, (d_prev + d_next - d_close) / d_bar),
-        "related": dist[seed_city, :].astype(float) / d_bar,
-        "density": problem["density"] / d_bar,
+        "saving": _by_city(tour, (d_prev + d_next - d_close) / scale),
+        "related": dist[seed_city, :].astype(float) / scale,
+        "density": problem["density"] / scale,
         "angle": _by_city(tour, cosang),
         "pos": (position - position[seed_city]) / float(n),
         "noise": rng.random(n),
     }
+    return {name: every[name] for name in ENABLED_FEATURES}
 
 
 def ils(problem, destroy_priority, iterations=100, k=10, seed=0):
@@ -310,12 +340,123 @@ SKELETON_WITH_STUB = (
 )
 
 
-def build_source(destroy_code: str) -> str:
-    """Full executable module: frozen ILS skeleton + candidate destroy function."""
+def stub_docstring(features=None, scaled: bool = False) -> str:
+    """Docstring for the stub, describing only the features actually exposed.
+
+    An ablation run must not advertise a feature it has removed, otherwise the
+    model writes `features["saving"]` in a run where that key does not exist and
+    every candidate is rejected.
+    """
+    enabled = normalize_features(features)
+    if scaled:
+        scale_line = (
+            "    The distance-like arrays are in RAW distance units (not divided by\n"
+            "    d_bar), so their magnitudes grow with the instance's coordinate scale."
+        )
+    else:
+        scale_line = (
+            "    All of them are scale-free: distances are divided by the current average\n"
+            "    edge length d_bar = tour_length / n, so the same program behaves the same\n"
+            "    way on 20-city and 200-city instances."
+        )
+    rows = {
+        "gap": "    gap      : (d(prev,i) + d(i,next)) / d(prev,next)      in [1, ...]",
+        "saving": "    saving   : (d(prev,i) + d(i,next) - d(prev,next)) / d_bar",
+        "related": "    related  : d(seed, i) / d_bar        distance to a random seed city",
+        "density": "    density  : mean_k d(i, .) / d_bar    local sparsity around city i",
+        "angle": "    angle    : cos(prev->i, i->next)     in [-1, 1]",
+        "pos": "    pos      : (position(i) - position(seed)) / n   in [-1, 1]",
+        "noise": "    noise    : U[0, 1)                   fixed random values for this round",
+    }
+    lines = [
+        '"""Score every city; the k highest scores are removed from the tour.',
+        "",
+        "Arguments",
+        "---------",
+        "features : dict[str, np.ndarray]",
+        "    %d arrays of shape (n,), each indexed by *city id* (not tour order)."
+        % (len(enabled),),
+        scale_line,
+        "",
+    ]
+    lines.extend(rows[name] for name in enabled if name in rows)
+    lines.extend([
+        "",
+        "Returns",
+        "-------",
+        "np.ndarray, shape (n,)",
+        '    One finite score per city; larger means "remove this city earlier".',
+        "    Only the relative order matters.",
+        '"""',
+    ])
+    return "\n".join(lines)
+
+
+def build_stub(features=None, scaled: bool = False) -> str:
+    """Skeleton source plus a stub whose docstring matches the feature set."""
+    enabled = normalize_features(features)
+    body = stub_docstring(enabled, scaled)
+    block = ""
+    if enabled != tuple(FEATURES) or scaled:
+        block = (
+            "# ---- feature configuration ----\n"
+            "ENABLED_FEATURES = %r\n"
+            "SCALE_FREE = %r\n\n" % (tuple(enabled), not scaled)
+        )
+    return (SKELETON_SOURCE.rstrip() + "\n\n\n" + block
+            + "# ---- Function to be evolved by FunSearch ----\n"
+            + "def destroy_priority(features):\n"
+            + "    "
+            + body.replace("\n", "\n    ")
+            + "\n")
+
+
+def normalize_features(features=None) -> tuple:
+    """Validate a feature subset and return it in canonical order.
+
+    ``None`` (or an empty sequence) means "all of them".  ``noise`` is always
+    kept because the trivial seed program reads it.
+    """
+    if not features:
+        return tuple(FEATURES)
+    wanted = set()
+    for name in features:
+        key = str(name).strip().lower()
+        if key not in FEATURES:
+            raise ValueError("unknown feature %r (choose from %s)"
+                             % (name, ", ".join(FEATURES)))
+        wanted.add(key)
+    wanted.update(ALWAYS_ON)
+    return tuple(name for name in FEATURES if name in wanted)
+
+
+def features_key(features=None, scaled: bool = False) -> str:
+    """Stable string used to scope caches and to record a run's configuration."""
+    return "features=%s;scale=%s" % (",".join(normalize_features(features)),
+                                     "raw" if scaled else "free")
+
+
+def build_source(destroy_code: str, features=None, scaled: bool = False) -> str:
+    """Full executable module: frozen ILS skeleton + candidate destroy function.
+
+    ``features`` (a subset of :data:`FEATURES`) and ``scaled`` (use raw distance
+    units instead of dividing by d_bar) are baked into the module as
+    ``ENABLED_FEATURES`` / ``SCALE_FREE``, so the very same candidate code is
+    measured against the feature configuration it was evolved for.
+    """
     code = (destroy_code or "").strip()
     if not code:
         raise ValueError("empty destroy_priority code")
-    source = SKELETON_SOURCE.rstrip() + "\n\n\n# ---- evolved by FunSearch ----\n" + code + "\n"
+    enabled = normalize_features(features)
+    block = ""
+    if enabled != tuple(FEATURES) or scaled:
+        block = (
+            "# ---- feature configuration ----\n"
+            "ENABLED_FEATURES = %r\n"
+            "SCALE_FREE = %r\n\n" % (tuple(enabled), not scaled)
+        )
+    source = (SKELETON_SOURCE.rstrip() + "\n\n\n" + block
+              + "# ---- evolved by FunSearch ----\n" + code + "\n")
     compile(source, "<FunSearch candidate (ils)>", "exec")
     return source
 

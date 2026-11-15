@@ -93,7 +93,8 @@ def score_from_lengths(
 
 
 def compute_baseline(
-    payload: Dict[str, dict], timeout: float = 60.0, skel=None
+    payload: Dict[str, dict], timeout: float = 60.0, skel=None,
+    features=None, scaled: bool = False,
 ) -> Dict[str, float]:
     """Tour lengths of the skeleton's seed program, one per instance.
 
@@ -103,11 +104,26 @@ def compute_baseline(
     to beat.
     """
     skel = skel if skel is not None else skeleton
-    source = skel.build_source(skel.SEED)
+    source = build_for(skel, skel.SEED, features, scaled)
     ok, result, _ = sandbox.run_source(source, payload, timeout=timeout)
     if not ok:
         raise RuntimeError("the seed program failed to run: %s" % (result,))
     return {name: float(v) for name, v in result["lengths"].items()}
+
+
+def build_for(skel, code: str, features=None, scaled: bool = False) -> str:
+    """``build_source`` that only forwards the feature config to the ILS skeleton."""
+    if getattr(skel, "NAME", "") == "ils":
+        return skel.build_source(code, features=features, scaled=scaled)
+    return skel.build_source(code)
+
+
+def feature_scope(skel, features=None, scaled: bool = False) -> str:
+    """Cache namespace: the skeleton *and* its feature configuration."""
+    name = getattr(skel, "NAME", "greedy")
+    if name != "ils":
+        return name
+    return "%s|%s" % (name, skel.features_key(features, scaled))
 
 
 def evaluate_program(
@@ -118,6 +134,8 @@ def evaluate_program(
     cache: Optional[sandbox.ResultCache] = None,
     use_cache: bool = True,
     skel=None,
+    features=None,
+    scaled: bool = False,
 ) -> Evaluation:
     """Static-check, execute and score one candidate program."""
     skel = skel if skel is not None else skeleton
@@ -132,7 +150,7 @@ def evaluate_program(
         return Evaluation(ok=False, error="rejected: %s" % (exc,))
 
     try:
-        source = skel.build_source(priority_code)
+        source = build_for(skel, priority_code, features, scaled)
     except SyntaxError as exc:  # pragma: no cover - validate_candidate catches it
         return Evaluation(ok=False, error="SyntaxError: %s" % (exc,))
 

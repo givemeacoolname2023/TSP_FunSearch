@@ -143,7 +143,10 @@ def _greedy_prompt(programs: Sequence[Program], train_names: Sequence[str], skel
     ]
 
 
-def _ils_prompt(programs: Sequence[Program], train_names: Sequence[str], skel) -> List[str]:
+def _ils_prompt(programs: Sequence[Program], train_names: Sequence[str], skel,
+                features=None, scaled: bool = False) -> List[str]:
+    stub = (skel.build_stub(features, scaled)
+            if hasattr(skel, "build_stub") else skel.SKELETON_WITH_STUB)
     return [
         "## Task",
         "The skeleton below solves a TSP instance with an iterated local search (ILS):",
@@ -162,7 +165,7 @@ def _ils_prompt(programs: Sequence[Program], train_names: Sequence[str], skel) -
         "",
         "## Frozen skeleton",
         "```python",
-        skel.SKELETON_WITH_STUB.rstrip(),
+        stub.rstrip(),
         "```",
         "",
         "## How programs are scored",
@@ -189,6 +192,8 @@ def build_prompt(
     baseline: dict,
     round_index: int = 0,
     skel=None,
+    features=None,
+    scaled: bool = False,
 ) -> str:
     """Best-shot prompt from ``programs`` (sorted internally by ascending score)."""
     skel = skel if skel is not None else skeleton
@@ -202,7 +207,7 @@ def build_prompt(
         "",
     ]
     task = (
-        _ils_prompt(ordered, train_names, skel)
+        _ils_prompt(ordered, train_names, skel, features, scaled)
         if is_ils
         else _greedy_prompt(ordered, train_names, skel)
     )
@@ -225,27 +230,56 @@ def build_prompt(
         )
 
     if is_ils:
+        from . import skeleton_ils
+
+        enabled = skeleton_ils.normalize_features(features)
+        feature_lines = [
+            "- `features` is a dict of %d arrays of shape (n,), all indexed by CITY ID:"
+            % (len(enabled),),
+        ]
+        for name in enabled:
+            feature_lines.append("  `%s` : %s" % (name, skeleton_ils.FEATURE_HELP[name]))
+        if scaled:
+            feature_lines.append(
+                "  The distance-like features are in RAW distance units (not normalised).")
+        else:
+            feature_lines.append(
+                "  The distance-like features are divided by the current average edge length,")
+            feature_lines.append(
+                "  so a program tuned on small instances behaves the same on large ones.")
+            feature_lines.append("  The raw distance matrix is NOT available.")
+
+        ideas = [
+            "Ideas that help in large-neighbourhood search:",
+        ]
+        if "related" in enabled:
+            ideas.append("- removing a spatially related cluster (`related`),")
+        if "saving" in enabled:
+            ideas.append("- removing the cities whose removal saves the most length (`saving`),")
+        if "density" in enabled:
+            ideas.append("- penalising cities in dense regions (`density`),")
+        if "angle" in enabled:
+            ideas.append("- preferring sharp turns (`angle`),")
+        if "pos" in enabled:
+            ideas.append("- spreading the removals along the tour instead of clustering them"
+                         " (`pos`),")
+        if "noise" in enabled:
+            ideas.append("- breaking ties with `noise`,")
+        ideas.append("and combining several of them with weights you choose.")
+
         footer = [
             "## Your task",
             "Write a NEW implementation called `%s_v%d` (a strictly better destroy operator)."
             % (wanted, len(ordered)),
             "Requirements:",
             "- Exactly the same signature: %s_v%d(features)" % (wanted, len(ordered)),
-            "- `features` is a dict of seven arrays of shape (n,), all indexed by CITY ID:",
-            "  `gap`, `saving`, `related`, `density`, `angle`, `pos`, `noise`.",
-            "  All distances are already divided by the current average edge length, so every",
-            "  feature is scale-free; a program tuned on 50-city instances must behave the same",
-            "  way on 200-city instances. The raw distance matrix is NOT available.",
+        ] + feature_lines + [
             "- Return a numpy array of exactly n finite scores; the k highest are removed.",
             "- Only the relative order of the scores matters.",
         ] + _IMPORT_RULES + [
             "- Prefer short, readable, deterministic code: shorter programs are sampled more often.",
             "",
-            "Ideas that help in large-neighbourhood search: removing a spatially related cluster",
-            "(related removal), removing the cities whose removal saves the most length (worst",
-            "removal), combining both, penalising cities in dense regions, breaking ties with",
-            "`noise`, and using `pos` to spread the removals along the tour instead of clustering",
-            "them all in one place.",
+        ] + ideas + [
             "",
             "Answer with ONE Python code block containing only the function definition of",
             "`%s_v%d`. No explanations, no tests, no example usage, no I/O."
