@@ -282,6 +282,63 @@ def figure_paired(found, group, out_path: Path, dpi: int) -> bool:
     return True
 
 
+def _collect_means(found, group):
+    means = {}
+    base = found["baselines"][group]
+    for method, path in base.items():
+        means[method] = summarize.per_instance_mean(
+            summarize.load_method([str(path)], "gap"))
+    for column, paths in found["stochastic"][group].items():
+        means[column] = summarize.per_instance_mean(
+            summarize.load_method([str(p) for p in paths], "gap"))
+    return means
+
+
+def figure_ladder_paper(found, group, out_path: Path, dpi: int = 300) -> bool:
+    """Single-panel version of F2 sized for a 16 cm column in the report.
+
+    The two-panel PNG is meant for the screen; at report width its axis labels
+    would be ~3 pt, so the paper copy uses one panel and larger type.
+    """
+    means = _collect_means(found, group)
+    rows = []
+    for _group_name, methods, colour in GROUPS_OF:
+        for method in methods:
+            if method in means and means[method]:
+                rows.append((float(np.mean(list(means[method].values()))),
+                             LABELS.get(method, method), colour))
+    if not rows:
+        print("  ! F2-paper: nothing to plot, skipped")
+        return False
+    rows.sort(key=lambda r: r[0])
+    values = [r[0] for r in rows]
+    labels = [r[1] for r in rows]
+    colours = [r[2] for r in rows]
+
+    fig, axis = plt.subplots(figsize=(7.2, 3.1))
+    positions = np.arange(len(rows))
+    axis.barh(positions, values, color=colours, height=0.76)
+    for pos, value in zip(positions, values):
+        axis.text(value + max(values) * 0.015, pos, "%.2f" % (value,),
+                  va="center", fontsize=6.0)
+    axis.set_yticks(positions)
+    axis.set_yticklabels(labels, fontsize=6.2)
+    axis.set_xlabel("mean gap to the published optimum (%)", fontsize=7)
+    axis.set_title("%s group (%d instances)" % (group, _count_instances(means)), fontsize=7.5)
+    axis.grid(axis="x", alpha=0.25, lw=0.5)
+    axis.set_xlim(0, max(values) * 1.22)
+    axis.tick_params(axis="x", labelsize=6)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for _n, _m, c in GROUPS_OF]
+    short = ["constructive", "constructive+LS", "NN+LS", "destroy ops", "evolved", "control"]
+    axis.legend(handles, short, fontsize=5.4, ncol=2, frameon=False,
+                loc="lower right", handlelength=1.1, columnspacing=0.8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print("  F2 (paper) -> %s" % (out_path,))
+    return True
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     runs_dir = Path(args.runs_dir)
@@ -294,6 +351,7 @@ def main(argv=None) -> int:
     done = [
         figure_convergence(runs_dir, out_dir / "F1_convergence.png", args.dpi),
         figure_ladder(found, groups, out_dir / "F2_improvement_ladder.png", args.dpi),
+        figure_ladder_paper(found, "final", out_dir / "F2_ladder_paper.png"),
         figure_paired(found, "final", out_dir / "F3_paired_final.png", args.dpi),
     ]
     print("done: %d/%d figures" % (sum(1 for d in done if d), len(done)))

@@ -1,0 +1,112 @@
+name,file,n,edge_weight_type,edge_weight_format,has_coords,opt,has_opt_tour,usable,verifiable,group,size_bucket,excluded_because
+a280,a280.tsp,280,EUC_2D,,1,2579,1,1,1,final,200<n<=500,
+ali535,ali535.tsp,535,GEO,,1,202339,0,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=GEO
+att48,att48.tsp,48,ATT,,1,10628,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=ATT
+att532,att532.tsp,532,ATT,,1,27686,0,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=ATT
+bayg29,bayg29.tsp,29,EXPLICIT,UPPER_ROW,0,1610,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+bays29,bays29.tsp,29,EXPLICIT,FULL_MATRIX,0,2020,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+berlin52,berlin52.tsp,52,EUC_2D,,1,7542,1,1,1,search,n<=100,
+bier127,bier127.tsp,127,EUC_2D,,1,118282,0,1,0,validation,100<n<=200,
+brazil58,brazil58.tsp,58,EXPLICIT,UPPER_ROW,0,25395,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+brd14051,brd14051.tsp,14051,EUC_2D,,1,469385,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+brg180,brg180.tsp,180,EXPLICIT,UPPER_ROW,0,1950,1,0,0,validation,100<n<=200,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+burma14,burma14.tsp,14,GEO,FUNCTION,1,3323,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=GEO
+ch130,ch130.tsp,130,EUC_2D,,1,6110,1,1,1,validation,100<n<=200,
+ch150,ch150.tsp,150,EUC_2D,,1,6528,1,1,1,validation,100<n<=200,
+d1291,d1291.tsp,1291,EUC_2D,,1,50801,0,1,0,transfer,n>500,
+d15112,d15112.tsp,15112,EUC_2D,,1,1573084,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+d1655,d1655.tsp,1655,EUC_2D,,1,62128,0,1,0,transfer,n>500,
+d18512,d18512.tsp,18512,EUC_2D,,1,645238,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+d198,d198.tsp,198,EUC_2D,,1,15780,0,1,0,validation,100<n<=200,
+d2103,d2103.tsp,2103,EUC_2D,,1,80450,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+d493,d493.tsp,493,EUC_2D,,1,35002,0,1,0,final,200<n<=500,
+d657,d657.tsp,657,EUC_2D,,1,48912,0,1,0,transfer,n>500,
+dantzig42,dantzig42.tsp,42,EXPLICIT,LOWER_DIAG_ROW,0,699,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+dsj1000,dsj1000.tsp,1000,CEIL_2D,,1,18659688,0,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=CEIL_2D
+eil101,eil101.tsp,101,EUC_2D,,1,629,1,1,1,validation,100<n<=200,
+eil51,eil51.tsp,51,EUC_2D,,1,426,1,1,1,search,n<=100,
+eil76,eil76.tsp,76,EUC_2D,,1,538,1,1,1,search,n<=100,
+fl1400,fl1400.tsp,1400,EUC_2D,,1,20127,0,1,0,transfer,n>500,
+fl1577,fl1577.tsp,1577,EUC_2D,,1,22249,0,1,0,transfer,n>500,
+fl3795,fl3795.tsp,3795,EUC_2D,,1,28772,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+fl417,fl417.tsp,417,EUC_2D,,1,11861,0,1,0,final,200<n<=500,
+fnl4461,fnl4461.tsp,4461,EUC_2D,,1,182566,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+fri26,fri26.tsp,26,EXPLICIT,LOWER_DIAG_ROW,0,937,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gil262,gil262.tsp,262,EUC_2D,,1,2378,0,1,0,final,200<n<=500,
+gr120,gr120.tsp,120,EXPLICIT,LOWER_DIAG_ROW,0,6942,1,0,0,validation,100<n<=200,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gr137,gr137.tsp,137,GEO,,1,69853,0,0,0,validation,100<n<=200,EDGE_WEIGHT_TYPE=GEO
+gr17,gr17.tsp,17,EXPLICIT,LOWER_DIAG_ROW,0,2085,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gr202,gr202.tsp,202,GEO,,1,40160,1,0,0,final,200<n<=500,EDGE_WEIGHT_TYPE=GEO
+gr21,gr21.tsp,21,EXPLICIT,LOWER_DIAG_ROW,0,2707,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gr229,gr229.tsp,229,GEO,,1,134602,0,0,0,final,200<n<=500,EDGE_WEIGHT_TYPE=GEO
+gr24,gr24.tsp,24,EXPLICIT,LOWER_DIAG_ROW,0,1272,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gr431,gr431.tsp,431,GEO,FUNCTION,1,171414,0,0,0,final,200<n<=500,EDGE_WEIGHT_TYPE=GEO
+gr48,gr48.tsp,48,EXPLICIT,LOWER_DIAG_ROW,0,5046,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+gr666,gr666.tsp,666,GEO,,1,294358,1,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=GEO
+gr96,gr96.tsp,96,GEO,,1,55209,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=GEO
+hk48,hk48.tsp,48,EXPLICIT,LOWER_DIAG_ROW,0,11461,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+kroA100,kroA100.tsp,100,EUC_2D,,1,21282,1,1,1,search,n<=100,
+kroA150,kroA150.tsp,150,EUC_2D,,1,26524,0,1,0,validation,100<n<=200,
+kroA200,kroA200.tsp,200,EUC_2D,,1,29368,0,1,0,validation,100<n<=200,
+kroB100,kroB100.tsp,100,EUC_2D,,1,22141,0,1,0,search,n<=100,
+kroB150,kroB150.tsp,150,EUC_2D,,1,26130,0,1,0,validation,100<n<=200,
+kroB200,kroB200.tsp,200,EUC_2D,,1,29437,0,1,0,validation,100<n<=200,
+kroC100,kroC100.tsp,100,EUC_2D,,1,20749,1,1,1,search,n<=100,
+kroD100,kroD100.tsp,100,EUC_2D,,1,21294,1,1,1,search,n<=100,
+kroE100,kroE100.tsp,100,EUC_2D,,1,22068,0,1,0,search,n<=100,
+lin105,lin105.tsp,105,EUC_2D,,1,14379,1,1,1,validation,100<n<=200,
+lin318,lin318.tsp,318,EUC_2D,,1,42029,0,1,0,final,200<n<=500,
+lin318,linhp318.tsp,318,EUC_2D,,1,42029,0,0,0,final,200<n<=500,duplicate NAME (using lin318.tsp)
+nrw1379,nrw1379.tsp,1379,EUC_2D,,1,56638,0,1,0,transfer,n>500,
+p654,p654.tsp,654,EUC_2D,,1,34643,0,1,0,transfer,n>500,
+pa561,pa561.tsp,561,EXPLICIT,LOWER_DIAG_ROW,0,2763,1,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+pcb1173,pcb1173.tsp,1173,EUC_2D,,1,56892,0,1,0,transfer,n>500,
+pcb3038,pcb3038.tsp,3038,EUC_2D,,1,137694,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+pcb442,pcb442.tsp,442,EUC_2D,,1,50778,1,1,1,final,200<n<=500,
+pla33810,pla33810.tsp,33810,CEIL_2D,,1,66048945,0,0,0,,n>500,EDGE_WEIGHT_TYPE=CEIL_2D
+pla7397,pla7397.tsp,7397,CEIL_2D,,1,23260728,0,0,0,,n>500,EDGE_WEIGHT_TYPE=CEIL_2D
+pla85900,pla85900.tsp,85900,CEIL_2D,,1,142382641,0,0,0,,n>500,EDGE_WEIGHT_TYPE=CEIL_2D
+pr1002,pr1002.tsp,1002,EUC_2D,,1,259045,1,1,1,transfer,n>500,
+pr107,pr107.tsp,107,EUC_2D,,1,44303,0,1,0,validation,100<n<=200,
+pr124,pr124.tsp,124,EUC_2D,,1,59030,0,1,0,validation,100<n<=200,
+pr136,pr136.tsp,136,EUC_2D,,1,96772,0,1,0,validation,100<n<=200,
+pr144,pr144.tsp,144,EUC_2D,,1,58537,0,1,0,validation,100<n<=200,
+pr152,pr152.tsp,152,EUC_2D,,1,73682,0,1,0,validation,100<n<=200,
+pr226,pr226.tsp,226,EUC_2D,,1,80369,0,1,0,final,200<n<=500,
+pr2392,pr2392.tsp,2392,EUC_2D,,1,378032,1,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+pr264,pr264.tsp,264,EUC_2D,,1,49135,0,1,0,final,200<n<=500,
+pr299,pr299.tsp,299,EUC_2D,,1,48191,0,1,0,final,200<n<=500,
+pr439,pr439.tsp,439,EUC_2D,,1,107217,0,1,0,final,200<n<=500,
+pr76,pr76.tsp,76,EUC_2D,,1,108159,1,1,1,search,n<=100,
+rat195,rat195.tsp,195,EUC_2D,,1,2323,0,1,0,validation,100<n<=200,
+rat575,rat575.tsp,575,EUC_2D,,1,6773,0,1,0,transfer,n>500,
+rat783,rat783.tsp,783,EUC_2D,,1,8806,0,1,0,transfer,n>500,
+rat99,rat99.tsp,99,EUC_2D,,1,1211,0,1,0,search,n<=100,
+rd100,rd100.tsp,100,EUC_2D,,1,7910,1,1,1,search,n<=100,
+rd400,rd400.tsp,400,EUC_2D,,1,15281,0,1,0,final,200<n<=500,
+rl11849,rl11849.tsp,11849,EUC_2D,,1,923288,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+rl1304,rl1304.tsp,1304,EUC_2D,,1,252948,0,1,0,transfer,n>500,
+rl1323,rl1323.tsp,1323,EUC_2D,,1,270199,0,1,0,transfer,n>500,
+rl1889,rl1889.tsp,1889,EUC_2D,,1,316536,0,1,0,transfer,n>500,
+rl5915,rl5915.tsp,5915,EUC_2D,,1,565530,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+rl5934,rl5934.tsp,5934,EUC_2D,,1,556045,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+si1032,si1032.tsp,1032,EXPLICIT,UPPER_DIAG_ROW,0,92650,0,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+si175,si175.tsp,175,EXPLICIT,UPPER_DIAG_ROW,0,21407,0,0,0,validation,100<n<=200,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+si535,si535.tsp,535,EXPLICIT,UPPER_DIAG_ROW,0,48450,0,0,0,transfer,n>500,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+st70,st70.tsp,70,EUC_2D,,1,675,1,1,1,search,n<=100,
+swiss42,swiss42.tsp,42,EXPLICIT,FULL_MATRIX,0,1273,0,0,0,search,n<=100,EDGE_WEIGHT_TYPE=EXPLICIT; no NODE_COORD_SECTION
+ts225,ts225.tsp,225,EUC_2D,,1,126643,0,1,0,final,200<n<=500,
+tsp225,tsp225.tsp,225,EUC_2D,,1,3916,1,1,1,final,200<n<=500,
+u1060,u1060.tsp,1060,EUC_2D,,1,224094,0,1,0,transfer,n>500,
+u1432,u1432.tsp,1432,EUC_2D,,1,152970,0,1,0,transfer,n>500,
+u159,u159.tsp,159,EUC_2D,,1,42080,0,1,0,validation,100<n<=200,
+u1817,u1817.tsp,1817,EUC_2D,,1,57201,0,1,0,transfer,n>500,
+u2152,u2152.tsp,2152,EUC_2D,,1,64253,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+u2319,u2319.tsp,2319,EUC_2D,,1,234256,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+u574,u574.tsp,574,EUC_2D,,1,36905,0,1,0,transfer,n>500,
+u724,u724.tsp,724,EUC_2D,,1,41910,0,1,0,transfer,n>500,
+ulysses16,ulysses16.tsp,16,GEO,,1,6859,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=GEO
+ulysses22,ulysses22.tsp,22,GEO,,1,7013,1,0,0,search,n<=100,EDGE_WEIGHT_TYPE=GEO
+usa13509,usa13509.tsp,13509,EUC_2D,,1,19982859,0,0,0,,n>500,"n>2000, beyond the phase-1 budget"
+vm1084,vm1084.tsp,1084,EUC_2D,,1,239297,0,1,0,transfer,n>500,
+vm1748,vm1748.tsp,1748,EUC_2D,,1,336556,0,1,0,transfer,n>500,
