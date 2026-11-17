@@ -6,17 +6,36 @@ The project compares 14 methods on three disjoint TSPLIB splits: three insertion
 
 **Headline result (final split, 13 instances of 225–493 cities, mean gap to the published optimum):**
 
-| method                                 | mean gap          |
-| -------------------------------------- | ----------------- |
-| constructors + local search            | 5.3–5.8 %         |
-| nearest neighbour + local search       | 3.54 %            |
-| ILS, random destruction (seed program) | 3.36 %            |
-| ILS, worst removal                     | 2.86 %            |
-| ILS, related removal                   | 2.27 %            |
-| **ILS, evolved operator (3 seeds)**    | **2.31 % ± 0.17** |
-| ILS, random-weight control (3 seeds)   | 2.12 % ± 0.24     |
+| method            | design layer                   | mean gap       |
+| ----------------- | ------------------------------ | -------------- |
+| `control`         | random weights, free features  | 2.12 % ± 0.24  |
+| `llm-raw`         | evolved, raw distance units    | 2.25 % ± 0.00  |
+| `related`         | destroy operator               | 2.27 %         |
+| `llm`             | evolved, free features         | 2.31 % ± 0.17  |
+| `control-raw`     | random weights, raw units      | 2.32 % ± 0.06  |
+| `worst`           | destroy operator               | 2.86 %         |
+| `random`          | destroy operator, seed program | 3.36 %         |
+| `lsonly`          | NN construction + local search | 3.54 %         |
+| `cheapest-ins-ls` | constructor + local search     | 5.27 %         |
+| `farthest-ins-ls` | constructor + local search     | 5.39 %         |
+| `nearest-ins-ls`  | constructor + local search     | 5.80 %         |
+| `farthest-ins`    | constructor only               | 9.72 %         |
+| `cheapest-ins`    | constructor only               | 18.66 %        |
+| `nearest-ins`     | constructor only               | 23.15 %        |
 
-The evolved operator beats random destruction by about one gap point, but is statistically indistinguishable from the strongest hand-written operator and from a random search over the same features at the same budget.
+Sorted best to worst. `±` is the standard deviation across the three seeds and
+applies only to the four searched or sampled methods (`llm`, `llm-raw`,
+`control`, `control-raw`); the ten hand-written methods are deterministic, so a
+single evaluation characterises them. The evolved operator beats random
+destruction by about one gap point, but is statistically indistinguishable from
+the strongest hand-written operator (`related`) and from a random search over the
+same features at the same budget (`control`).
+
+![Mean gap of the 14 methods on the final split](runs/figures/F2_ladder_paper.png)
+
+*Local search is worth 12–15 gap points, the choice of destroy operator about
+one, and the evolved operator ends up level with the hand-written `related`
+operator and with the random-weight control.*
 
 ## Environment
 
@@ -62,8 +81,6 @@ copy .env.example .env      # then put your DEEPSEEK_API_KEY into .env
 
 Reproducing the full study costs about **1.1M tokens** (six LLM runs) and roughly **45 minutes** of CPU time; everything except steps 2 and 4 is free.
 
-`runs/` is not committed (it holds run artefacts). Regenerate it with the commands above — steps 6–8 only read the CSVs, so they always agree with whatever is in `runs/`.
-
 ## Repository layout
 
 ```
@@ -86,6 +103,7 @@ tools/
   make_tables.py         summary_<split>.md from the CSVs
   plot_figures.py        convergence / improvement ladder / paired scatter
   measure_work.py        per-method work accounting (budget matching)
+  summarize.py           paired statistics on CSVs: means, std across seeds, 95% CI, win/loss/tie
 tsp_files/               63 TSPLIB instances (EUC_2D) + data/split.json
 ```
 
